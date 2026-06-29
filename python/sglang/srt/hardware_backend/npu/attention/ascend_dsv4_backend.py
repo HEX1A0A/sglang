@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_A5_KV_TILE_SIZE = 64
+_A5_KV_ROPE_HEAD_DIM = 64
+_A5_PACKED_KV_DIM = 640
+
 
 def _walsh_hadamard_matrix(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     # n**-0.5 norm is baked in via the sqrt(2) division per doubling; _apply_hadamard is a plain matmul
@@ -60,6 +64,15 @@ def _overlap_transform(
     out[:, r:] = tensor[..., d:]
     out[1:, :r] = tensor[:-1, :, :d]
     return out
+
+
+def _check_a5_packed_kv(name: str, kv: torch.Tensor) -> None:
+    if kv.shape[-1] != _A5_PACKED_KV_DIM:
+        raise RuntimeError(
+            f"{name} must be A5 packed KV with last dim {_A5_PACKED_KV_DIM} "
+            f"for npu_kv_quant_sparse_attn_sharedkv, got shape={tuple(kv.shape)}. "
+            "The cache should be written through torch.ops.custom.kv_compress_epilog."
+        )
 
 
 class CompressorAscendBackendMixin(CompressorBackendMixin):
@@ -1269,6 +1282,7 @@ class DeepseekV4AscendAttnBackend(
         is_nextn: bool,
     ) -> dict:
         common = {
+            "kv_quant_mode": 1,
             "cu_seqlens_q": actual_seq_lengths_q_pa,
             "seqused_kv": actual_seq_lengths_kv,
             "cmp_ratio": 1,
@@ -1289,7 +1303,7 @@ class DeepseekV4AscendAttnBackend(
         }
         c1a_kwargs = base_kwargs | common
         kernel_metadata = {
-            "c1a_metadata": torch.ops.custom.npu_sparse_attn_sharedkv_metadata(
+            "c1a_metadata": torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(
                 **c1a_kwargs
             )
         }
@@ -1302,7 +1316,7 @@ class DeepseekV4AscendAttnBackend(
             }
             c4a_kwargs = c1a_kwargs | c4a_overrides
             kernel_metadata["c4a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c4a_kwargs)
+                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(**c4a_kwargs)
             )
 
             if actual_seq_lengths_q_pa is not None:
@@ -1332,7 +1346,7 @@ class DeepseekV4AscendAttnBackend(
             c128a_overrides = {"cmp_ratio": 128, "has_cmp_kv": True}
             c128a_kwargs = c1a_kwargs | c128a_overrides
             kernel_metadata["c128a_metadata"] = (
-                torch.ops.custom.npu_sparse_attn_sharedkv_metadata(**c128a_kwargs)
+                torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv_metadata(**c128a_kwargs)
             )
 
         return kernel_metadata
@@ -1377,8 +1391,11 @@ class DeepseekV4AscendAttnBackend(
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
         ori_kv = pool.get_swa_buffer(layer.layer_id)
-
+        _check_a5_packed_kv("ori_kv", ori_kv)
         attn_kwargs = dict(
+            kv_quant_mode=1,
+            tile_size=_A5_KV_TILE_SIZE,
+            rope_head_dim=_A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1392,8 +1409,9 @@ class DeepseekV4AscendAttnBackend(
             sinks=attn_sink,
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
+            cmp_ratio=1,
         )
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
     def _forward_compressed(
@@ -1422,7 +1440,8 @@ class DeepseekV4AscendAttnBackend(
             )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
-
+        _check_a5_packed_kv("ori_kv", ori_kv)
+        _check_a5_packed_kv("cmp_kv", cmp_kv)
         ori_page_size = ori_kv.shape[1]
         cmp_native_page_size = cmp_kv.shape[1]
         cmp_block_table = getattr(fm, f"c{compress_ratio}_page_table")
@@ -1433,6 +1452,9 @@ class DeepseekV4AscendAttnBackend(
         )
 
         attn_kwargs = dict(
+            kv_quant_mode=1,
+            tile_size=_A5_KV_TILE_SIZE,
+            rope_head_dim=_A5_KV_ROPE_HEAD_DIM,
             cu_seqlens_q=fm.actual_seq_lengths_q_pa,
             seqused_kv=fm.actual_seq_lengths_kv,
             ori_mask_mode=4,
@@ -1457,7 +1479,7 @@ class DeepseekV4AscendAttnBackend(
             attn_kwargs["cmp_sparse_indices"] = topk.view(-1, 1, topk.shape[-1])
         else:
             attn_kwargs["cmp_sparse_indices"] = None
-        out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
+        out, _ = torch.ops.custom.npu_kv_quant_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
     def store_cache(self, *, layer_id: int, swa_k: torch.Tensor, forward_batch):
