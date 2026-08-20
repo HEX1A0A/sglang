@@ -78,6 +78,11 @@ _is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+# Internal tensor-dict metadata used by NPU one-way P2P sends. The receiver
+# removes this entry before returning the user payload.
+_P2P_REVERSE_ACK_KEY = "__sglang_p2p_reverse_ack__"
+_P2P_SKIP_OUTPUT_TOKEN_KEY = "__sglang_pp_skip_output_token__"
+
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
@@ -112,7 +117,7 @@ class GraphCaptureContext:
 @dataclass
 class P2PWork:
     work: Optional[torch.distributed.Work]
-    payload: Optional[torch.Tensor]
+    payload: Optional[Union[torch.Tensor, List[torch.Tensor]]]
 
 
 def _split_tensor_dict(
@@ -1751,6 +1756,156 @@ class GroupCoordinator:
                 p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
+    def send_tensor_dict_with_reverse_ack(
+        self,
+        tensor_dict: Dict[str, Union[torch.Tensor, Any]],
+        dst: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> List[P2PWork]:
+        """Asynchronously send a one-way device payload with a reverse ACK.
+
+        Device payload sends and the one-byte ACK receive are submitted in one
+        ``batch_isend_irecv`` call. CPU metadata remains asynchronous so the
+        scheduler can continue forwarding PD control and proxy messages.
+        """
+        if self.world_size == 1:
+            return []
+
+        if dst is None:
+            dst = (self.rank_in_group + 1) % self.world_size
+        assert dst < self.world_size, f"Invalid dst rank ({dst})"
+
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+        has_device_tensor = any(
+            tensor.numel() > 0 and not tensor.is_cpu for tensor in tensor_list
+        )
+        if has_device_tensor:
+            metadata_list.insert(0, (_P2P_REVERSE_ACK_KEY, True))
+
+        p2p_works = self.send_object(metadata_list, dst=dst, async_send=True)
+        device_ops: List[torch.distributed.P2POp] = []
+        device_payloads: List[torch.Tensor] = []
+        if has_device_tensor:
+            ack = torch.empty(1, dtype=torch.uint8, device=self.device)
+            device_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    ack,
+                    self.ranks[dst],
+                    group=self.device_group,
+                )
+            )
+            device_payloads.append(ack)
+
+        for tensor in tensor_list:
+            if tensor.numel() == 0:
+                continue
+            if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+            if tensor.is_cpu:
+                work = torch.distributed.isend(
+                    tensor, self.ranks[dst], group=self.cpu_group
+                )
+                p2p_works.append(P2PWork(work, tensor))
+            else:
+                device_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        tensor,
+                        self.ranks[dst],
+                        group=self.device_group,
+                    )
+                )
+                device_payloads.append(tensor)
+
+        if device_ops:
+            works = torch.distributed.batch_isend_irecv(device_ops)
+            if not works:
+                raise RuntimeError(
+                    "batch_isend_irecv returned no work for a device transfer"
+                )
+            p2p_works.extend(P2PWork(work, device_payloads) for work in works)
+        return p2p_works
+
+    def _recv_tensor_dict_with_reverse_ack(
+        self,
+        recv_metadata_list: List[Tuple[str, Any]],
+        src: int,
+        all_gather_group: Optional["GroupCoordinator"],
+    ) -> Dict[str, Union[torch.Tensor, Any]]:
+        """Receive a marked one-way payload and ACK it in the device batch."""
+        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
+        all_gather_rank = (
+            0 if all_gather_group is None else all_gather_group.rank_in_group
+        )
+        tensor_dict: Dict[str, Any] = {}
+        device_ops: List[torch.distributed.P2POp] = []
+        received_tensors: List[
+            Tuple[str, torch.Tensor, bool, Optional[torch.Size]]
+        ] = []
+
+        for key, value in recv_metadata_list:
+            if not isinstance(value, TensorMetadata):
+                tensor_dict[key] = value
+                continue
+
+            tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+            if tensor.numel() == 0:
+                tensor_dict[key] = tensor
+                continue
+            use_all_gather = (
+                all_gather_group is not None and tensor.numel() % all_gather_size == 0
+            )
+            orig_shape = None
+            if use_all_gather:
+                orig_shape = tensor.shape
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            if tensor.is_cpu:
+                work = torch.distributed.irecv(
+                    tensor, src=self.ranks[src], group=self.cpu_group
+                )
+                work.wait()
+                if use_all_gather:
+                    tensor = all_gather_group.all_gather(tensor, dim=0)
+                    tensor = tensor.reshape(orig_shape)
+                tensor_dict[key] = tensor
+            else:
+                device_ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv,
+                        tensor,
+                        self.ranks[src],
+                        group=self.device_group,
+                    )
+                )
+                received_tensors.append((key, tensor, use_all_gather, orig_shape))
+
+        if not device_ops:
+            raise RuntimeError("Received a reverse-ACK request without a device tensor")
+        ack = torch.empty(1, dtype=torch.uint8, device=self.device)
+        device_ops.append(
+            torch.distributed.P2POp(
+                torch.distributed.isend,
+                ack,
+                self.ranks[src],
+                group=self.device_group,
+            )
+        )
+        for work in torch.distributed.batch_isend_irecv(device_ops):
+            work.wait()
+
+        for key, tensor, use_all_gather, orig_shape in received_tensors:
+            if use_all_gather:
+                tensor = all_gather_group.all_gather(tensor, dim=0)
+                tensor = tensor.reshape(orig_shape)
+            tensor_dict[key] = tensor
+        return tensor_dict
+
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,
@@ -1776,6 +1931,15 @@ class GroupCoordinator:
         assert src < self.world_size, f"Invalid src rank ({src})"
 
         recv_metadata_list = self.recv_object(src=src)
+        if bool(
+            recv_metadata_list
+            and recv_metadata_list[0][0] == _P2P_REVERSE_ACK_KEY
+            and recv_metadata_list[0][1]
+        ):
+            return self._recv_tensor_dict_with_reverse_ack(
+                recv_metadata_list[1:], src, all_gather_group
+            )
+
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1890,6 +2054,48 @@ class GroupCoordinator:
             req.wait()
 
         recv_metadata_list = pickle.loads(recv_meta_data.numpy())
+        needs_reverse_ack = bool(
+            recv_metadata_list
+            and recv_metadata_list[0][0] == _P2P_REVERSE_ACK_KEY
+            and recv_metadata_list[0][1]
+        )
+        if needs_reverse_ack:
+            recv_metadata_list = recv_metadata_list[1:]
+
+        send_skip_token = send_tensor_dict.get(_P2P_SKIP_OUTPUT_TOKEN_KEY)
+        # With PP=2, send and recv use the same peer. If both directions are
+        # skip tokens, both ranks can symmetrically omit the device transfer
+        # and retain the metadata-only fast path. This is unsafe for PP>2,
+        # where send and recv peers differ.
+        elide_same_peer_skip_token = False
+        if (
+            isinstance(send_skip_token, torch.Tensor)
+            and not needs_reverse_ack
+            and send_dst == recv_src
+            and send_tensor_dict.get("__skip__") is True
+            and not send_skip_token.is_cpu
+            and send_skip_token.dtype == torch.uint8
+            and send_skip_token.numel() == 1
+        ):
+            recv_skip = any(
+                key == "__skip__" and value is True
+                for key, value in recv_metadata_list
+            )
+            recv_skip_token_metadata = next(
+                (
+                    value
+                    for key, value in recv_metadata_list
+                    if key == _P2P_SKIP_OUTPUT_TOKEN_KEY
+                ),
+                None,
+            )
+            elide_same_peer_skip_token = (
+                recv_skip
+                and isinstance(recv_skip_token_metadata, TensorMetadata)
+                and recv_skip_token_metadata.device != "cpu"
+                and recv_skip_token_metadata.dtype == torch.uint8
+                and recv_skip_token_metadata.size == torch.Size([1])
+            )
 
         # ---- 2. Prepare recv buffers and collect all tensor ops ----
         recv_tensor_dict: Dict[str, Any] = {}
@@ -1900,6 +2106,9 @@ class GroupCoordinator:
 
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
+                if elide_same_peer_skip_token and key == _P2P_SKIP_OUTPUT_TOKEN_KEY:
+                    recv_tensor_dict[key] = send_skip_token
+                    continue
                 tensor = torch.empty(
                     value.size, dtype=value.dtype, device=value.device
                 )
@@ -1933,8 +2142,28 @@ class GroupCoordinator:
             else:
                 recv_tensor_dict[key] = value
 
+        if needs_reverse_ack:
+            if not any(not tensor.is_cpu for _, tensor, _, _ in recv_tensor_info):
+                raise RuntimeError(
+                    "Received a reverse-ACK request without a device tensor"
+                )
+            ack = torch.empty(1, dtype=torch.uint8, device=self.device)
+            # Keep the ACK before ordinary sends. In PP=2, recv_src and
+            # send_dst are the same peer, so ordering prevents the sender's
+            # one-byte ACK receive from matching a normal payload.
+            tensor_ops.append(
+                torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    ack,
+                    self.ranks[recv_src],
+                    group=group,
+                )
+            )
+
         # Add send ops
         for tensor in send_tensor_list:
+            if elide_same_peer_skip_token and tensor is send_skip_token:
+                continue
             if tensor.numel() == 0:
                 continue
             send_t = tensor

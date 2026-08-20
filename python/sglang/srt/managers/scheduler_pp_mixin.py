@@ -15,7 +15,10 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import (
+    _P2P_SKIP_OUTPUT_TOKEN_KEY,
+    P2PWork,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -581,6 +584,11 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self._pp_npu_skip_output_token = None
+        if is_npu() and envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get():
+            self._pp_npu_skip_output_token = torch.empty(
+                1, dtype=torch.uint8, device=self.device
+            )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1132,6 +1140,16 @@ class SchedulerPPMixin:
         d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
 
+    def _pp_make_npu_skip_output_dict(self: Scheduler):
+        token = self._pp_npu_skip_output_token
+        if token is None:
+            raise RuntimeError("NPU PP skip output token is not initialized")
+        return {
+            "__msg_type__": "output",
+            "__skip__": True,
+            _P2P_SKIP_OUTPUT_TOKEN_KEY: token,
+        }
+
     def _pp_prep_batch_result(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -1323,9 +1341,9 @@ class SchedulerPPMixin:
         )
 
         # ---- Prepare send dict ----
-        # On NPU, always send something (full output or a lightweight skip
-        # marker) so the peer's recv in batch_isend_irecv always has a
-        # matching send.  Without this, SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM
+        # On NPU, always send something (full output or a skip marker with a
+        # one-byte device token) so the peer's batch always has paired device
+        # send/recv ops. Without this, SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM
         # would cause asymmetric skip decisions between adjacent ranks
         # (send target and recv target are different micro-batches), leading
         # to deadlock or forcing the user to disable the optimisation
@@ -1337,14 +1355,14 @@ class SchedulerPPMixin:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not target_send.forward_mode.is_prebuilt():
                     if _pp_can_skip_output_comm(target_send):
-                        send_dict = {"__msg_type__": "output", "__skip__": True}
+                        send_dict = self._pp_make_npu_skip_output_dict()
                     else:
                         self.device_module.current_stream().wait_event(q_event)
                         send_dict = dict(pp_outputs_to_send.tensors)
                         send_dict["__msg_type__"] = "output"
         elif pp_outputs:
             if pp_outputs.tensors.get("__skip__"):
-                send_dict = {"__msg_type__": "output", "__skip__": True}
+                send_dict = self._pp_make_npu_skip_output_dict()
             else:
                 send_dict = dict(pp_outputs.tensors)
                 send_dict["__msg_type__"] = "output"
@@ -1360,9 +1378,29 @@ class SchedulerPPMixin:
             and not target_recv.forward_mode.is_prebuilt()
         )
 
+        # A nonblocking one-way output may arrive while this rank is waiting
+        # for a proxy message. _pp_recv_typed_dict stashes that output after
+        # completing its reverse ACK. Consume it here instead of posting a
+        # second receive for the same microbatch.
+        recv_dict = None
+        output_inbox = self._pp_tensor_dict_inbox.get("output")
+        if should_recv and output_inbox:
+            recv_dict = output_inbox.popleft()
+        should_recv_from_peer = should_recv and recv_dict is None
+
         def _handle_recv_dict(recv_dict):
             nonlocal next_pp_outputs, batch_result, d2h_event
             if recv_dict.get("__skip__"):
+                skip_token = recv_dict.pop(_P2P_SKIP_OUTPUT_TOKEN_KEY, None)
+                if (
+                    not isinstance(skip_token, torch.Tensor)
+                    or skip_token.is_cpu
+                    or skip_token.dtype != torch.uint8
+                    or skip_token.numel() != 1
+                ):
+                    raise RuntimeError(
+                        "NPU PP skip output is missing its one-byte device token"
+                    )
                 # _pp_make_skip_output_result returns next_pp_outputs=None
                 # (correct for the non-NPU path where the skip propagates
                 # via pp_outputs=None).  On NPU we must propagate the skip
@@ -1382,7 +1420,7 @@ class SchedulerPPMixin:
                     d2h_event.record(self.device_module.current_stream())
 
         # ---- Execute communication ----
-        if send_dict is not None and should_recv:
+        if send_dict is not None and should_recv_from_peer:
             # Paired send + recv via batch_isend_irecv
             with torch.profiler.record_function("send_recv_res_dict"):
                 recv_dict = self.pp_group.send_recv_tensor_dict(
@@ -1390,16 +1428,22 @@ class SchedulerPPMixin:
                     send_all_gather_group=all_gather_group,
                     recv_all_gather_group=all_gather_group,
                 )
-            _handle_recv_dict(recv_dict)
         elif send_dict is not None:
-            # Send only (recv not needed — target is None or prebuilt)
-            send_output_work = self._pp_send_dict_to_next_stage(
-                send_dict, async_send=True, msg_type="output"
+            # A standalone HCCL isend can block the scheduler before it
+            # forwards the current proxy/control messages. Pair the device
+            # payload with a reverse ACK receive in one batched call, but do
+            # not wait here. The receiver completes the ACK while receiving
+            # and demultiplexing this typed output message.
+            send_output_work = self.pp_group.send_tensor_dict_with_reverse_ack(
+                tensor_dict=send_dict,
+                all_gather_group=all_gather_group,
             )
-        elif should_recv:
+        elif should_recv_from_peer:
             # Recv only (no send needed)
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
                 recv_dict = self._pp_recv_dict_from_prev_stage()
+
+        if recv_dict is not None:
             _handle_recv_dict(recv_dict)
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
