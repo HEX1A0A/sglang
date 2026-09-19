@@ -1198,6 +1198,7 @@ class KimiK3MoE(nn.Module):
                 # AllGather is already queued. Delay shared GEMMs until the
                 # gate, TopK and latent down projection finish on current.
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
+                torch.npu.set_stream_limit(self.alt_stream, cube_num=8, vector_num=16)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_compute_event = self.alt_stream.record_event()
@@ -1209,6 +1210,7 @@ class KimiK3MoE(nn.Module):
                 # communication and the shared MLP, while routed GEMMs wait
                 # only for the MLP (not for RS).
                 self.alt_stream.wait_stream(current_stream)
+                torch.npu.reset_stream_limit(self.alt_stream)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self._reduce_scatter_shared_experts(
                         shared_output, hidden_states
@@ -1560,6 +1562,7 @@ class KimiK3MoE(nn.Module):
         once, and prefix_sum is consumed in the tail add like the non-DP
         path — gathering first would just replicate the whole batch onto
         every rank (tp-fold redundant compute + a2a traffic)."""
+
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         use_dp = self._dp_attention and forward_batch is not None and not self._ep_a2a
