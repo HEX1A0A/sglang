@@ -2131,7 +2131,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         self.use_output_gate = getattr(config, "mla_use_output_gate", False)
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
-        self._disable_npu_fused_split_qk_norm = True
+        self._disable_npu_fused_split_qk_norm = False
         super().__init__(
             layer_id=layer_idx,
             hidden_size=config.hidden_size,
