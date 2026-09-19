@@ -408,6 +408,12 @@ def _add3(
 # One-shot log guard: proves the merged front is live (see _ep_front).
 _EP_FRONT_LOGGED = False
 
+# Number of routing periods pre-expanded into the static ASCEND_FAKE_TOPK
+# table. The forward only slices [:num_tokens], so the table must hold at
+# least max_num_tokens rows; matches the legacy table's static capacity
+# (num_experts/top_k * 512 rows, e.g. 28672 for 896 experts / top_k 16).
+_FAKE_TOPK_PERIOD_REPEATS = 512
+
 
 def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
@@ -457,14 +463,63 @@ class KimiK3MoE(nn.Module):
         self.alt_stream = alt_stream
         self._dp_attention = is_dp_attention_enabled()
 
-        fake_topk = torch.arange(config.n_routed_experts)
-        fake_topk = torch.cat([fake_topk[::2], fake_topk[1::2]])
-        self.tp_rank = get_parallel().tp_rank
-        fake_topk = torch.cat([
-            fake_topk[self.tp_rank * config.n_routed_experts // self.tp_size::1],
-            fake_topk[:self.tp_rank * config.n_routed_experts // self.tp_size:1]
-        ])
-        self.fake_topk = fake_topk.repeat(512).view(-1, 16).to(torch.int32).npu()
+        # Debug-only static routing table consumed when ASCEND_FAKE_TOPK=1.
+        # EP-balanced layout: the token dispatcher shards experts by a
+        # contiguous global-id range, so expert e lives on EP rank
+        # e // (num_experts // ep_size). Slot g = token * top_k + j is sent to
+        # rank (g % ep_size) and walks that rank's local experts (g // ep_size):
+        #   e = (g % ep_size) * local + g // ep_size.
+        # Each token fans out across distinct EP ranks and the per-rank load
+        # stays within +/-1 for any token count; over a full period every
+        # expert is hit exactly once. With a disjoint-token-shard a2a backend
+        # (DeepEP / FuseEP / ...), each rank additionally rolls the table by
+        # its EP rank so the combined EP-wide dispatch is perfectly balanced.
+        # The entire layout (balanced period + rank phase + period repeat) is
+        # baked into one static tensor here; the forward only takes a plain
+        # view slice self.fake_topk[:num_tokens], i.e. zero launched ops and a
+        # static shape, which keeps it NPU-graph-capture friendly. Fall back to
+        # the legacy strided/tp-rotated layout when experts are not evenly
+        # divisible by the EP domain (e.g. redundant expert replicas).
+        num_experts = config.n_routed_experts
+        top_k = config.num_experts_per_token
+        period = num_experts // top_k
+        parallel = get_parallel()
+        ep_size = parallel.moe_ep_size
+        row_shift = 0
+        if ep_size > 1 and num_experts % ep_size == 0:
+            num_local_experts = num_experts // ep_size
+            slot = torch.arange(num_experts, dtype=torch.int64)
+            fake_experts = (
+                (slot % ep_size) * num_local_experts + slot // ep_size
+            )
+            _a2a_backend = get_moe_a2a_backend()
+            if (
+                _a2a_backend.is_megamoe()
+                or _a2a_backend.is_deepep()
+                or _a2a_backend.is_mooncake()
+                or _a2a_backend.is_ascend_fuseep()
+                or _a2a_backend.is_mori()
+            ):
+                # Ranks hold disjoint token shards: rank r's token t is global
+                # token t + r, so start its table r rows later.
+                row_shift = parallel.moe_ep_rank
+        else:
+            tp_rank = parallel.tp_rank
+            shift = tp_rank * num_experts // self.tp_size
+            fake_experts = torch.arange(num_experts)
+            fake_experts = torch.cat(
+                [fake_experts[::2], fake_experts[1::2]]
+            )
+            fake_experts = torch.cat(
+                [fake_experts[shift:], fake_experts[:shift]]
+            )
+        # (period, top_k) balanced table, apply the per-rank phase, then repeat
+        # the period to the same static row capacity as the legacy table
+        # (512 periods). All of this runs once at construction, never in forward.
+        fake_table = fake_experts.reshape(period, top_k).to(torch.int32)
+        if row_shift:
+            fake_table = fake_table.roll(-row_shift, dims=0)
+        self.fake_topk = fake_table.repeat(_FAKE_TOPK_PERIOD_REPEATS, 1).npu()
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -964,9 +1019,11 @@ class KimiK3MoE(nn.Module):
             from sglang.srt.layers.moe.topk import (
                 StandardTopKOutput,
             )
+            # Plain view slice of the pre-baked static table: no launched op,
+            # static shape -> safe under NPU graph capture/replay.
             topk_output = StandardTopKOutput(
                 topk_output.topk_weights,
-                self.fake_topk[:hidden_states.shape[0]],
+                self.fake_topk[: hidden_states.shape[0]],
                 topk_output.router_logits,
             )
             return topk_output
