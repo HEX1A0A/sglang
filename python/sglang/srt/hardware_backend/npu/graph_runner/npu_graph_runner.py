@@ -118,6 +118,11 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
             and model_runner.kv_cache_dtype_str == "fp8_e4m3"
             and not is_deepseek_dsa(model_runner.model_config.hf_config)
         )
+        self.use_mla_fp8_a2a = (
+            self.use_mla_fp8
+            and envs.SGLANG_NPU_SPARSE_ATTN_A2A.get()
+            and self.attn_tp_size > 1
+        )
         self.if_use_v2 = self.use_mla_fp8 or any(
             arch
             in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM", "Step3p5ForCausalLM")
@@ -281,6 +286,12 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 seq_lens = forward_batch.seq_lens.cpu().tolist() + [0] * (
                     self.bs - self.raw_bs
                 )
+            if self.use_mla_fp8_a2a:
+                # Match the captured FIA's request shard, not the live batch.
+                local_bs = (self.bs + self.attn_tp_size - 1) // self.attn_tp_size
+                seq_lens += [0] * (local_bs * self.attn_tp_size - len(seq_lens))
+                req_start = self.attn_tp_rank * local_bs
+                seq_lens = seq_lens[req_start : req_start + local_bs]
             output = self.backend.replay_with_input_update(
                 graph_key,
                 seq_lens=seq_lens,

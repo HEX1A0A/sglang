@@ -43,6 +43,9 @@ def _runner(
     bsnd=False,
     dspark=True,
     architectures=None,
+    a2a=False,
+    attn_tp_size=8,
+    attn_tp_rank=0,
 ):
     names = {
         "_init_arch_map",
@@ -66,6 +69,9 @@ def _runner(
         "is_deepseek_dsa": lambda c: c.dsa,
         "is_deepseek_v4": lambda c: False,
         "LogitsProcessorOutput": Output,
+        "envs": SimpleNamespace(
+            SGLANG_NPU_SPARSE_ATTN_A2A=SimpleNamespace(get=lambda: a2a)
+        ),
     }
     module = ast.fix_missing_locations(
         ast.Module(
@@ -80,6 +86,8 @@ def _runner(
     )
     exec(compile(module, str(SOURCE), "exec"), namespace)  # noqa: S102
     runner = namespace["Runner"]()
+    runner.attn_tp_size = attn_tp_size
+    runner.attn_tp_rank = attn_tp_rank
     runner.model_runner = SimpleNamespace(
         model_config=SimpleNamespace(
             attention_arch=arch,
@@ -104,7 +112,8 @@ def _runner(
         for n in init.body
         if isinstance(n, ast.Assign)
         and any(
-            isinstance(t, ast.Attribute) and t.attr in ("use_mla_fp8", "if_use_v2")
+            isinstance(t, ast.Attribute)
+            and t.attr in ("use_mla_fp8", "use_mla_fp8_a2a", "if_use_v2")
             for t in n.targets
         )
     ]
@@ -191,6 +200,89 @@ def test_empty_c8_verify_rank_updates_the_captured_v2_graph():
     assert output.next_token_logits.shape[0] == 0
 
 
+@pytest.mark.parametrize("capture_mode,width", [("decode", 1), ("verify", 4)])
+@pytest.mark.parametrize(
+    "bucket,rank,full_lengths",
+    [
+        (8, 0, [100]),
+        (8, 7, [107]),
+        (16, 0, [100, 101]),
+        (16, 7, [114, 115]),
+        (10, 0, [100, 101]),
+        (10, 7, [0, 0]),
+    ],
+)
+def test_c8_a2a_replay_uses_fixed_bucket_request_shards(
+    capture_mode, width, bucket, rank, full_lengths
+):
+    runner = _runner(capture_mode=capture_mode, a2a=True, attn_tp_rank=rank)
+    runner.bs = bucket
+    runner.captured_req_width = width
+    assert runner.use_mla_fp8_a2a
+    for live in (bucket, 1, bucket):
+        runner.raw_bs = live
+        runner.raw_num_token = live * width
+        final = list(range(100, 100 + live))
+        prefix = [length - width for length in final]
+        runner.execute(
+            _batch(capture_mode, prefix, final)
+            if capture_mode == "verify"
+            else _batch(seq_lens=final)
+        )
+        kw = runner.backend.replay_with_input_update.call_args.kwargs
+        expected = full_lengths if live == bucket else [0] * len(full_lengths)
+        if live == 1 and rank == 0:
+            expected[0] = 100
+        assert kw["attr_name"] == "actual_seq_kvlen"
+        assert kw["seq_lens"] == expected
+        assert kw["attr_type"] == []
+
+
+@pytest.mark.parametrize(
+    "bucket,rank,local_bs", [(8, 0, 1), (8, 7, 1), (16, 0, 2), (16, 7, 2), (10, 7, 2)]
+)
+def test_c8_a2a_verify_idle_clears_local_lengths_then_resumes(bucket, rank, local_bs):
+    runner = _runner(capture_mode="verify", a2a=True, attn_tp_rank=rank)
+    runner.bs = bucket
+    runner.captured_req_width = 4
+    runner.raw_bs, runner.raw_num_token = bucket, bucket * 4
+    prefix = list(range(127, 127 + bucket))
+    final = [length + 4 for length in prefix]
+    runner.execute(_batch("verify", prefix, final))
+    first = runner.backend.replay_with_input_update.call_args.kwargs["seq_lens"]
+    runner.raw_bs = runner.raw_num_token = 0
+    runner.execute(_batch("idle", final, final))
+    assert (
+        runner.backend.replay_with_input_update.call_args.kwargs["seq_lens"]
+        == [0] * local_bs
+    )
+    runner.raw_bs, runner.raw_num_token = bucket, bucket * 4
+    runner.execute(_batch("verify", prefix, final))
+    assert runner.backend.replay_with_input_update.call_args.kwargs["seq_lens"] == first
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"a2a": False},
+        {"a2a": True, "attn_tp_size": 1},
+        {"a2a": True, "dtype": "bf16"},
+        {"a2a": True, "dtype": "bf16", "draft": True},
+        {"a2a": True, "arch": "MHA", "draft": True},
+    ],
+)
+def test_a2a_length_sharding_only_applies_to_enabled_dense_c8_tp(kwargs):
+    runner = _runner(**kwargs)
+    assert not runner.use_mla_fp8_a2a
+    runner.execute(_batch(seq_lens=[10, 20]))
+    assert runner.backend.replay_with_input_update.call_args.kwargs["seq_lens"] == [
+        10,
+        20,
+        0,
+        0,
+    ]
+
+
 @pytest.mark.parametrize(
     "arch,dtype,draft,dsa,expected",
     [
@@ -239,7 +331,8 @@ def test_bf16_dspark_verify_and_idle_retain_existing_selection(bsnd, key):
 
 
 def test_dsa_keeps_its_replay_without_host_length_update():
-    runner = _runner(dsa=True)
+    runner = _runner(dsa=True, a2a=True)
+    assert not runner.use_mla_fp8_a2a
     runner.execute(_batch())
     runner.backend.replay.assert_called_once()
     runner.backend.replay_with_input_update.assert_not_called()

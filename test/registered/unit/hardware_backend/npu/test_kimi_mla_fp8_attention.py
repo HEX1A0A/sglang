@@ -39,6 +39,8 @@ def _load_backend(fia_v2):
         "forward_mtp",
         "_init_cuda_graph_metadata",
         "_apply_cuda_graph_metadata",
+        "_a2a_fias_v2_sizes",
+        "init_forward_metadata",
     }
     cls = ast.ClassDef(
         name="Backend",
@@ -194,15 +196,29 @@ def test_empty_dp_rank_skips_fia():
     fia.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "attribute,value",
-    [("use_sparse_attn_a2a", True), ("attn_cp_size", 2)],
-)
-def test_unsupported_c8_parallel_paths_fail_explicitly(attribute, value):
+def test_unsupported_c8_context_parallel_fails_explicitly():
     backend, _, fia, args = _case()
-    setattr(backend, attribute, value)
-    with pytest.raises(NotImplementedError, match="non-CP/non-A2A"):
+    backend.attn_cp_size = 2
+    with pytest.raises(NotImplementedError, match="non-CP"):
         backend.forward_decode(**args)
+    fia.assert_not_called()
+
+
+def test_c8_a2a_requires_replicated_single_kv_head():
+    backend, _, fia, args = _case()
+    backend.use_sparse_attn_a2a = True
+    args["layer"].tp_k_head_num = 2
+    with pytest.raises(NotImplementedError, match="single KV head"):
+        backend.forward_decode(**args)
+    fia.assert_not_called()
+
+
+def test_c8_a2a_does_not_treat_variable_draft_extend_as_static_verify():
+    backend, _, fia, args = _case(tokens=4, width=4)
+    backend.use_sparse_attn_a2a = True
+    args["forward_batch"].forward_mode.is_draft_extend_v2 = lambda: True
+    with pytest.raises(NotImplementedError, match="static target-verify"):
+        backend.forward_extend(**args)
     fia.assert_not_called()
 
 
@@ -389,6 +405,74 @@ def test_c8_gate_excludes_dsa_and_draft_gqa(mla, dsa, dtype, expected):
         {"self": backend, "model_runner": runner, "is_deepseek_dsa": lambda _: dsa},
     )
     assert backend.use_mla_fp8 is expected
+
+
+def _set_cpu_length_requirement(backend, flag):
+    init = next(
+        n
+        for n in BACKEND.body
+        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+    )
+    assignment = next(
+        n
+        for n in init.body
+        if isinstance(n, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute) and t.attr == "needs_cpu_seq_lens"
+            for t in n.targets
+        )
+    )
+    exec(  # noqa: S102
+        compile(ast.Module(body=[assignment], type_ignores=[]), str(SOURCE), "exec"),
+        {
+            "self": backend,
+            "envs": SimpleNamespace(
+                SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=SimpleNamespace(
+                    get=lambda: flag
+                )
+            ),
+        },
+    )
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+@pytest.mark.parametrize("flag", [False, True])
+def test_cpu_length_opt_out_respects_the_c8_fia_host_interface(fp8, flag):
+    backend = SimpleNamespace(use_mla_fp8=fp8)
+    _set_cpu_length_requirement(backend, flag)
+    assert backend.needs_cpu_seq_lens is (fp8 or flag)
+
+
+@pytest.mark.parametrize("width", [1, 4])
+def test_cpu_opt_out_still_builds_c8_eager_metadata_and_final_verify_lengths(width):
+    backend, _, fia, args = _case(tokens=2 * width, width=width)
+    _set_cpu_length_requirement(backend, False)
+    backend.device = "cpu"
+    backend.is_hybrid_swa = backend.use_sliding_window_kv_pool = False
+    backend.req_to_token_pool = SimpleNamespace(
+        req_to_token=torch.arange(3 * 512).view(3, 512)
+    )
+    batch = args["forward_batch"]
+    batch.batch_size = 2
+    batch.req_pool_indices = torch.tensor([1, 2])
+    batch.seq_lens = torch.tensor([127, 255])
+    final = [127 + width, 255 + width] if width > 1 else [127, 255]
+    batch.seq_lens_cpu = torch.tensor(final)
+    batch.extend_seq_lens = torch.tensor([width, width]) if width > 1 else None
+    batch.extend_seq_lens_cpu = [width, width] if width > 1 else []
+    batch.spec_algorithm = SimpleNamespace(is_dspark=lambda: True)
+    batch.forward_mode.is_extend = lambda: width > 1
+    batch.forward_mode.is_decode_or_idle = lambda: width == 1
+    if width == 1:
+        batch.spec_info = None
+    backend.init_forward_metadata(batch)
+    assert backend.forward_metadata.seq_lens_cpu_int.tolist() == final
+    if width > 1:
+        backend.forward_extend(**args)
+    else:
+        backend.forward_decode(**args)
+    assert fia.call_args.kwargs["actual_seq_kvlen"] == final
+    assert fia.call_args.kwargs["block_table"].shape[0] == 2
 
 
 def test_prefix_reader_dequantizes_only_historical_latent(monkeypatch):

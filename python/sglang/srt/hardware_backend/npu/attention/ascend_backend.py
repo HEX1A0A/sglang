@@ -396,7 +396,8 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
         if self.use_mla:
-            self.mtp_mask = self.mtp_mask.to(torch.int8)
+            if not self.use_mla_fp8:
+                self.mtp_mask = self.mtp_mask.to(torch.int8)
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
@@ -409,7 +410,12 @@ class AscendAttnBackend(AttentionBackend):
             and self.token_to_kv_pool.swa_layer_nums > 0
         )
 
-        self.needs_cpu_seq_lens = envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get()
+        # C8 FIA v2 and NPUGraph.update consume host KV lengths, including
+        # DSpark's final verify boundary. The device-only opt-out is not valid
+        # for this operator, even when attention TP A2A is enabled.
+        self.needs_cpu_seq_lens = (
+            envs.SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS.get() or self.use_mla_fp8
+        )
 
         # AllToAll optimization for sparse attention across attention TP ranks
         self.use_sparse_attn_a2a = (
@@ -3020,10 +3026,11 @@ class AscendAttnBackend(AttentionBackend):
         is_verify,
     ):
         # Same FIA v2 C8 contract for eager and graph decode/static verify.
-        if self.use_sparse_attn_a2a or self.attn_cp_size > 1:
-            raise NotImplementedError(
-                "MLA C8 currently requires non-CP/non-A2A execution"
-            )
+        if self.attn_cp_size > 1:
+            raise NotImplementedError("MLA C8 currently requires non-CP execution")
+        use_a2a = self.use_sparse_attn_a2a
+        if use_a2a and layer.tp_k_head_num != 1:
+            raise NotImplementedError("MLA C8 A2A requires a replicated single KV head")
         if dequant_scale_q_nope is None or fp8_kv_scale is None:
             raise ValueError(
                 "MLA C8 requires Q per-token-head and KV per-tensor descales"
@@ -3053,6 +3060,7 @@ class AscendAttnBackend(AttentionBackend):
         q_scale = dequant_scale_q_nope.view(-1, layer.tp_q_head_num)[:num_tokens]
         kv_scale = fp8_kv_scale.reshape(-1).to(device=q.device, dtype=torch.float32)
 
+        width = 1
         if is_verify:
             spec_info = forward_batch.spec_info
             if getattr(spec_info, "ragged_verify_layout", None) is not None:
@@ -3060,6 +3068,10 @@ class AscendAttnBackend(AttentionBackend):
                     "MLA C8 target verify currently requires static DSpark blocks"
                 )
             if forward_batch.forward_mode.is_draft_extend_v2():
+                if use_a2a:
+                    raise NotImplementedError(
+                        "MLA C8 A2A requires decode or static target-verify blocks"
+                    )
                 query_lens = forward_batch.extend_seq_lens_cpu
                 actual_seq_qlen = np.cumsum(query_lens).tolist()
                 batch_size = len(query_lens)
@@ -3075,9 +3087,6 @@ class AscendAttnBackend(AttentionBackend):
         else:
             batch_size = num_tokens
             actual_seq_qlen = None
-            q = q.unsqueeze(1)
-            q_rope = q_rope.unsqueeze(1)
-            q_scale = q_scale.unsqueeze(1)
             input_layout = "BSND"
 
         # DSpark's CPU metadata already includes the verify block. Do not add
@@ -3089,6 +3098,84 @@ class AscendAttnBackend(AttentionBackend):
         else:
             kv_lens = kv_lens.tolist()
         kv_lens = kv_lens[:batch_size]
+        block_table = fm.block_tables[:batch_size]
+        num_query_heads = layer.tp_q_head_num
+        live_output = output[:num_tokens]
+        if use_a2a:
+            parallel = get_parallel()
+            tp_size = parallel.attn_tp_size
+            tp_group = parallel.attn_tp_group
+            t_padded, t_local, local_bs, padded_bs = self._a2a_fias_v2_sizes(
+                batch_size, tp_size, width
+            )
+            req_start = parallel.attn_tp_rank * local_bs
+            # As in BF16 A2A, trade request rows for all Q heads. Transport
+            # mixed dtypes as bytes: no FP8 collective or numerical cast, and
+            # the per-token-head scale travels with its exact Q/side pair.
+            q_bytes = self.kv_lora_rank * q.element_size()
+            side_bytes = self.qk_rope_head_dim * q_rope.element_size()
+            packed = torch.cat(
+                (
+                    q.contiguous().view(torch.uint8),
+                    q_rope.contiguous().view(torch.uint8),
+                    q_scale.unsqueeze(-1).contiguous().view(torch.uint8),
+                ),
+                dim=-1,
+            )
+            if t_padded > num_tokens:
+                padding = packed.new_zeros(
+                    t_padded - num_tokens, num_query_heads, packed.shape[-1]
+                )
+                padding[..., q_bytes + side_bytes :] = torch.ones(
+                    1, dtype=torch.float32, device=q.device
+                ).view(torch.uint8)
+                packed = torch.cat((packed, padding), dim=0)
+            received = torch.empty_like(packed)
+            tp_group.all_to_all_single(received.view(-1), packed.view(-1))
+            packed = (
+                received.view(tp_size, t_local, num_query_heads, -1)
+                .transpose(0, 1)
+                .contiguous()
+                .view(t_local, tp_size * num_query_heads, -1)
+            )
+            num_query_heads *= tp_size
+            q = packed[..., :q_bytes].contiguous().view(torch.float8_e4m3fn)
+            q_rope = (
+                packed[..., q_bytes : q_bytes + side_bytes]
+                .contiguous()
+                .view(torch.bfloat16)
+            )
+            q_scale = (
+                packed[..., q_bytes + side_bytes :]
+                .contiguous()
+                .view(torch.float32)
+                .squeeze(-1)
+            )
+            kv_lens = (kv_lens + [0] * (padded_bs - batch_size))[
+                req_start : req_start + local_bs
+            ]
+            if padded_bs > batch_size:
+                block_table = torch.cat(
+                    (
+                        block_table,
+                        block_table.new_zeros(
+                            padded_bs - batch_size, block_table.shape[1]
+                        ),
+                    ),
+                    dim=0,
+                )
+            # These are captured tensor operations, so replay reads the
+            # refreshed full page table rather than a stale Python-side copy.
+            block_table = block_table[req_start : req_start + local_bs]
+            if is_verify:
+                actual_seq_qlen = list(range(width, t_local + 1, width))
+            live_output = output.new_empty(t_local, num_query_heads, self.kv_lora_rank)
+
+        if not is_verify:
+            q = q.unsqueeze(1)
+            q_rope = q_rope.unsqueeze(1)
+            q_scale = q_scale.unsqueeze(1)
+            live_output = live_output.unsqueeze(1)
         c_kv = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         k_rope = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
         if is_fia_nz():
@@ -3103,20 +3190,17 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.view(
                 -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
             )
-        live_output = output[:num_tokens]
-        if not is_verify:
-            live_output = live_output.unsqueeze(1)
         torch_npu.npu_fused_infer_attention_score_v2.out(
             q.contiguous(),
             c_kv,
             c_kv,
             query_rope=q_rope.contiguous(),
             key_rope=k_rope,
-            num_query_heads=layer.tp_q_head_num,
+            num_query_heads=num_query_heads,
             num_key_value_heads=layer.tp_k_head_num,
             input_layout=input_layout,
             softmax_scale=layer.scaling,
-            block_table=fm.block_tables[:batch_size],
+            block_table=block_table,
             block_size=self.page_size,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_kvlen=kv_lens,
@@ -3130,6 +3214,23 @@ class AscendAttnBackend(AttentionBackend):
             query_quant_mode=3,
             out=[live_output, torch.empty(1, dtype=torch.bfloat16, device=q.device)],
         )
+        if use_a2a:
+            # Return each source rank's head shard in the original token order.
+            send_output = (
+                live_output.view(
+                    t_local, tp_size, layer.tp_q_head_num, self.kv_lora_rank
+                )
+                .transpose(0, 1)
+                .contiguous()
+                .view(-1)
+            )
+            recv_output = torch.empty_like(send_output)
+            tp_group.all_to_all_single(recv_output, send_output)
+            output[:num_tokens].copy_(
+                recv_output.view(t_padded, layer.tp_q_head_num, self.kv_lora_rank)[
+                    :num_tokens
+                ]
+            )
         return output.flatten(1)
 
     def forward_mtp(
