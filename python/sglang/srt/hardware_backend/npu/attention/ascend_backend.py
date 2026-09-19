@@ -391,6 +391,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
         )
         if self.use_mla:
+            self.mtp_mask = self.mtp_mask.to(torch.int8)
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
         self.is_hybrid_swa = model_runner.is_hybrid_swa
         if self.is_hybrid_swa:
@@ -2010,7 +2011,7 @@ class AscendAttnBackend(AttentionBackend):
             cache_seqlens=md.a2a_cache_seqlens_local,
             cu_seqlens_q=None,
             seqused_q=md.a2a_seqused_q_local,
-            attn_mask=self.mtp_mask.to(torch.int8),
+            attn_mask=self.mtp_mask,
             metadata=md.a2a_metadata_flash_mla,
             head_dim_v=self.kv_lora_rank,
             softmax_scale=layer.scaling,
@@ -3332,7 +3333,7 @@ class AscendAttnBackend(AttentionBackend):
                         cache_seqlens=self.forward_metadata.seq_lens.to(torch.int32),
                         cu_seqlens_q=None,
                         seqused_q=self.forward_metadata.seqused_q.to(torch.int32),
-                        attn_mask=self.mtp_mask.to(torch.int8), # ?? todo
+                        attn_mask=self.mtp_mask,
                         metadata=self.forward_metadata.metadata_flash_mla,
                         head_dim_v=512,
                         softmax_scale=layer.scaling,
