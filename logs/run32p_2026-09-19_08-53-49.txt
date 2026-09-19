@@ -1,0 +1,1 @@
+mki_log delete old file:/root/ascend/log/atb/atb_1628727_20260909190158.log
