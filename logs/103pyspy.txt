@@ -1,0 +1,156 @@
+root@133_C01_B04_CPU7:/workspace# ps -eo pid,args | grep '[s]glang::scheduler'
+ 678913 sglang::scheduler_DP1_TP8_EP8
+ 678914 sglang::scheduler_DP1_TP9_EP9
+ 678915 sglang::scheduler_DP1_TP10_EP10
+ 678916 sglang::scheduler_DP1_TP11_EP11
+ 678917 sglang::scheduler_DP1_TP12_EP12
+ 678918 sglang::scheduler_DP1_TP13_EP13
+ 678919 sglang::scheduler_DP1_TP14_EP14
+ 678920 sglang::scheduler_DP1_TP15_EP15
+root@133_C01_B04_CPU7:/workspace# py-spy dump --pid 678913
+Process 678913: sglang::scheduler_DP1_TP8_EP8
+Python v3.12.13 (/usr/local/python3.12.13/bin/python3.12)
+
+Thread 678913 (active): "MainThread"
+    synchronize (torch_npu/npu/streams.py:192)
+    process_batch_result_idle (scheduler_components/batch_result_processor.py:863)
+    process_batch_result (scheduler.py:4234)
+    wrapper (utils/nvtx_utils.py:109)
+    pop_and_process (scheduler.py:1841)
+    event_loop_overlap (scheduler.py:1890)
+    decorate_context (torch/utils/_contextlib.py:124)
+    dispatch_event_loop (scheduler.py:5287)
+    run_event_loop (scheduler.py:1781)
+    run_scheduler_process (scheduler.py:5441)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 679963 (idle): "Thread-1 (_watchdog_thread)"
+    _watchdog_once (utils/watchdog.py:147)
+    _watchdog_thread (utils/watchdog.py:127)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683556 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683989 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683990 (idle): "Thread-2 (_watchdog_thread)"
+    _watchdog_once (utils/watchdog.py:147)
+    _watchdog_thread (utils/watchdog.py:127)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 684009 (idle): "npu-graph-update_0"
+    _worker (concurrent/futures/thread.py:90)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+root@133_C01_B04_CPU7:/workspace# py-spy dump --pid 678913
+Process 678913: sglang::scheduler_DP1_TP8_EP8
+Python v3.12.13 (/usr/local/python3.12.13/bin/python3.12)
+
+Thread 678913 (active): "MainThread"
+    synchronize (torch_npu/npu/streams.py:192)
+    process_batch_result_idle (scheduler_components/batch_result_processor.py:863)
+    process_batch_result (scheduler.py:4234)
+    wrapper (utils/nvtx_utils.py:109)
+    pop_and_process (scheduler.py:1841)
+    event_loop_overlap (scheduler.py:1890)
+    decorate_context (torch/utils/_contextlib.py:124)
+    dispatch_event_loop (scheduler.py:5287)
+    run_event_loop (scheduler.py:1781)
+    run_scheduler_process (scheduler.py:5441)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 679963 (idle): "Thread-1 (_watchdog_thread)"
+    _watchdog_once (utils/watchdog.py:147)
+    _watchdog_thread (utils/watchdog.py:127)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683556 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683989 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683990 (idle): "Thread-2 (_watchdog_thread)"
+    _watchdog_once (utils/watchdog.py:147)
+    _watchdog_thread (utils/watchdog.py:127)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 684009 (idle): "npu-graph-update_0"
+    _worker (concurrent/futures/thread.py:90)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+root@133_C01_B04_CPU7:/workspace# py-spy dump --pid 678913
+Process 678913: sglang::scheduler_DP1_TP8_EP8
+Python v3.12.13 (/usr/local/python3.12.13/bin/python3.12)
+
+Thread 678913 (active): "MainThread"
+    synchronize (torch_npu/npu/streams.py:192)
+    process_batch_result_idle (scheduler_components/batch_result_processor.py:863)
+    process_batch_result (scheduler.py:4234)
+    wrapper (utils/nvtx_utils.py:109)
+    pop_and_process (scheduler.py:1841)
+    event_loop_overlap (scheduler.py:1890)
+    decorate_context (torch/utils/_contextlib.py:124)
+    dispatch_event_loop (scheduler.py:5287)
+    run_event_loop (scheduler.py:1781)
+    run_scheduler_process (scheduler.py:5441)
+    run (multiprocessing/process.py:108)
+    _bootstrap (multiprocessing/process.py:314)
+    _main (multiprocessing/spawn.py:135)
+    spawn_main (multiprocessing/spawn.py:122)
+    <module> (<string>:1)
+Thread 679963 (idle): "Thread-1 (_watchdog_thread)"
+    _watchdog_once (utils/watchdog.py:147)
+    _watchdog_thread (utils/watchdog.py:127)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683556 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683989 (idle): "tqdm_monitor"
+    wait (threading.py:359)
+    wait (threading.py:655)
+    run (tqdm/_monitor.py:69)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 683990 (idle): "Thread-2 (_watchdog_thread)"
+    _watchdog_once (utils/watchdog.py:147)
+    _watchdog_thread (utils/watchdog.py:127)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
+Thread 684009 (idle): "npu-graph-update_0"
+    _worker (concurrent/futures/thread.py:90)
+    run (threading.py:1012)
+    _bootstrap_inner (threading.py:1075)
+    _bootstrap (threading.py:1032)
