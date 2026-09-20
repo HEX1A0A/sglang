@@ -3190,30 +3190,49 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.view(
                 -1, layer.tp_k_head_num, self.page_size, self.qk_rope_head_dim
             )
-        torch_npu.npu_fused_infer_attention_score_v2.out(
+        from fia_decode_c8_tilelang_h24 import fia_decode_c8, workspace_numel
+        workspace = torch.empty(workspace_numel(batch_size, 4), dtype=torch.float32, device=device)
+        
+        fia_decode_c8(
             q.contiguous(),
             c_kv,
-            c_kv,
-            query_rope=q_rope.contiguous(),
-            key_rope=k_rope,
-            num_query_heads=num_query_heads,
-            num_key_value_heads=layer.tp_k_head_num,
-            input_layout=input_layout,
-            softmax_scale=layer.scaling,
-            block_table=block_table,
-            block_size=self.page_size,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_kvlen=kv_lens,
-            sparse_mode=3 if is_verify else 0,
-            atten_mask=self.mtp_mask if is_verify else None,
-            dequant_scale_query=q_scale.contiguous(),
-            dequant_scale_key=kv_scale,
-            dequant_scale_value=kv_scale,
-            key_quant_mode=0,
-            value_quant_mode=0,
-            query_quant_mode=3,
-            out=[live_output, torch.empty(1, dtype=torch.bfloat16, device=q.device)],
+            q_rope.contiguous(),
+            k_rope,
+            block_table,
+            actual_seq_qlen,
+            q_scale.contiguous(),
+            kv_scale,
+            out = live_output,
+            workspace = workspace,
+            seq_len = 140 * 1024,
+            num_cores = 32,
+            splits = 4
         )
+
+        # torch_npu.npu_fused_infer_attention_score_v2.out(
+        #     q.contiguous(),
+        #     c_kv,
+        #     c_kv,
+        #     query_rope=q_rope.contiguous(),
+        #     key_rope=k_rope,
+        #     num_query_heads=num_query_heads,
+        #     num_key_value_heads=layer.tp_k_head_num,
+        #     input_layout=input_layout,
+        #     softmax_scale=layer.scaling,
+        #     block_table=block_table,
+        #     block_size=self.page_size,
+        #     actual_seq_qlen=actual_seq_qlen,
+        #     actual_seq_kvlen=kv_lens,
+        #     sparse_mode=3 if is_verify else 0,
+        #     atten_mask=self.mtp_mask if is_verify else None,
+        #     dequant_scale_query=q_scale.contiguous(),
+        #     dequant_scale_key=kv_scale,
+        #     dequant_scale_value=kv_scale,
+        #     key_quant_mode=0,
+        #     value_quant_mode=0,
+        #     query_quant_mode=3,
+        #     out=[live_output, torch.empty(1, dtype=torch.bfloat16, device=q.device)],
+        # )
         if use_a2a:
             # Return each source rank's head shard in the original token order.
             send_output = (
