@@ -1198,7 +1198,11 @@ class KimiK3MoE(nn.Module):
                 # AllGather is already queued. Delay shared GEMMs until the
                 # gate, TopK and latent down projection finish on current.
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
-                torch.npu.set_stream_limit(self.alt_stream, cube_num=8, vector_num=16)
+                if envs.SGLANG_NPU_8P_CASE.get():
+                    core_num = 12
+                else:
+                    core_num = 8
+                torch.npu.set_stream_limit(self.alt_stream, cube_num=core_num, vector_num=core_num * 2)
                 with torch.cuda.stream(self.alt_stream):
                     shared_output = self.shared_experts(shared_input)
                     shared_compute_event = self.alt_stream.record_event()
