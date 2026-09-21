@@ -1651,6 +1651,8 @@ class Envs:
         "/tmp/sglang_weight_cache_rank{global_rank}.ready"
     )
     SGLANG_NPU_SPARSE_ATTN_A2A = EnvBool(False)
+    SGLANG_NPU_INDEXER_TP = EnvBool(False)
+    SGLANG_K3_STREAM_LIMIT = EnvBool(False)
 
 
 envs = Envs()
