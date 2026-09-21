@@ -1726,28 +1726,54 @@ class KimiK3DeltaAttention(nn.Module):
         self.do_fuse_qkvbfg = quant_config is None and self.attn_tp_size == self.tp_size
 
         if self.use_full_rank_gate:
-            # Fuse only the alignment-friendly wide projections [q, k, v, g]
-            # (6144/rank at TP8). Folding b (12/rank) and f_a (128, replicated)
-            # in as well skews the output dim to 6284 and measurably degrades
-            # the GEMM kernel selection; they stay as separate tiny GEMVs.
-            self.fused_qkvg_proj = MergedColumnParallelLinear(
-                self.hidden_size,
-                [
+            if envs.SGLANG_K3_SPLIT_QKVG.get():
+                # Split path: fuse [q, k, v] into one linear and keep g_proj
+                # separate. Needed for ModelSlim-quantized checkpoints where
+                # q/k/v are W8A8_MXFP8 but g_proj stays FLOAT — mixed precision
+                # inside a single fused layer is not allowed.
+                self.fused_qkv_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    [
+                        projection_size,
+                        projection_size,
+                        projection_size,
+                    ],
+                    bias=False,
+                    quant_config=quant_config,
+                    tp_rank=self.attn_tp_rank,
+                    tp_size=self.attn_tp_size,
+                    prefix=f"{prefix}.fused_qkv_proj",
+                )
+                self.g_proj = ColumnParallelLinear(
+                    self.hidden_size,
                     projection_size,
-                    projection_size,
-                    projection_size,
-                    projection_size,
-                ],
-                bias=False,
-                quant_config=quant_config,
-                tp_rank=self.attn_tp_rank,
-                tp_size=self.attn_tp_size,
-                prefix=f"{prefix}.fused_qkvg_proj",
-            )
-            self.split_sizes = [
-                3 * projection_size // self.attn_tp_size,
-                projection_size // self.attn_tp_size,
-            ]
+                    bias=False,
+                    quant_config=quant_config,
+                    tp_rank=self.attn_tp_rank,
+                    tp_size=self.attn_tp_size,
+                    prefix=f"{prefix}.g_proj",
+                )
+            else:
+                # Fused path: [q, k, v, g] in one GEMM. Only safe when all four
+                # shards share the same precision (e.g. non-quantized models).
+                self.fused_qkvg_proj = MergedColumnParallelLinear(
+                    self.hidden_size,
+                    [
+                        projection_size,
+                        projection_size,
+                        projection_size,
+                        projection_size,
+                    ],
+                    bias=False,
+                    quant_config=quant_config,
+                    tp_rank=self.attn_tp_rank,
+                    tp_size=self.attn_tp_size,
+                    prefix=f"{prefix}.fused_qkvg_proj",
+                )
+                self.split_sizes = [
+                    3 * projection_size // self.attn_tp_size,
+                    projection_size // self.attn_tp_size,
+                ]
             self.b_proj = ColumnParallelLinear(
                 self.hidden_size,
                 self.num_heads,
@@ -2074,6 +2100,7 @@ class KimiK3DeltaAttention(nn.Module):
 
     def forward_qkvbfg_fused(self, hidden_states: torch.Tensor):
         if self.use_full_rank_gate:
+            split_qkvg = envs.SGLANG_K3_SPLIT_QKVG.get()
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
@@ -2085,7 +2112,7 @@ class KimiK3DeltaAttention(nn.Module):
                     and 0 < hidden_states.shape[0] <= self._bfa_bs_limit
                 ):
                     # Issue the tiny [f_a|b] + f_b GEMVs on the side stream,
-                    # then the wide [q,k,v,g] GEMM on the main stream; both
+                    # then the wide [q,k,v,(g)] GEMM on the main stream; both
                     # read only hidden_states. Join before the split's
                     # consumers touch beta/forget_gate.
                     alt = self._bfa_alt_stream
@@ -2095,21 +2122,37 @@ class KimiK3DeltaAttention(nn.Module):
                         bfa = gemm(hidden_states, w)
                         forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                         beta = bfa[..., n_fa : n_fa + n_b]
+                    if split_qkvg:
+                        qkv, _ = self.fused_qkv_proj(hidden_states)
+                        g_proj_states, _ = self.g_proj(hidden_states)
+                    else:
+                        fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                        qkv, g_proj_states = torch.split(
+                            fused_states, self.split_sizes, dim=-1
+                        )
+                    cur.wait_stream(alt)
+                    return qkv, beta, forget_gate, g_proj_states
+
+                if split_qkvg:
+                    qkv, _ = self.fused_qkv_proj(hidden_states)
+                    g_proj_states, _ = self.g_proj(hidden_states)
+                else:
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
                     qkv, g_proj_states = torch.split(
                         fused_states, self.split_sizes, dim=-1
                     )
-                    cur.wait_stream(alt)
-                    return qkv, beta, forget_gate, g_proj_states
-
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 bfa = gemm(hidden_states, w)
                 forget_gate = gemm(bfa[..., :n_fa], self._bfa_f_b_w)
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
-                qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
+                if split_qkvg:
+                    qkv, _ = self.fused_qkv_proj(hidden_states)
+                    g_proj_states, _ = self.g_proj(hidden_states)
+                else:
+                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    qkv, g_proj_states = torch.split(
+                        fused_states, self.split_sizes, dim=-1
+                    )
                 beta = self.b_proj(hidden_states)[0]
                 forget_gate = self.f_b_proj(self.f_a_proj(hidden_states)[0])[0]
         else:
@@ -3249,9 +3292,11 @@ class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
     # ModelSlim describes quantization with the original checkpoint module
-    # names. Register the runtime fused QKVG module so it can resolve the
-    # q_proj scheme while the weight loader packs q/k/v/g into its shards.
+    # names. Register both possible runtime fused modules so the quant config
+    # can resolve the q_proj scheme regardless of the SGLANG_K3_SPLIT_QKVG
+    # setting. Only one of the two is actually instantiated at runtime.
     packed_modules_mapping = {
+        "fused_qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
     }
 
@@ -3384,8 +3429,17 @@ class KimiK3LinearForCausalLM(nn.Module):
         use_full_rank_gate = bool(
             (self.config.linear_attn_config or {}).get("use_full_rank_gate", False)
         )
-        if use_full_rank_gate:
-            # Fused layout (K3): [q, k, v, g] column-parallel; b / f_a / f_b
+        split_qkvg = envs.SGLANG_K3_SPLIT_QKVG.get()
+        if use_full_rank_gate and split_qkvg:
+            # Split layout: [q, k, v] column-parallel; g_proj / b / f_a / f_b
+            # are standalone modules loaded by name.
+            fused_qkvbfg_mapping = [
+                (".fused_qkv_proj", ".q_proj", 0),
+                (".fused_qkv_proj", ".k_proj", 1),
+                (".fused_qkv_proj", ".v_proj", 2),
+            ]
+        elif use_full_rank_gate:
+            # Fused layout: [q, k, v, g] column-parallel; b / f_a / f_b
             # are standalone modules loaded by name.
             fused_qkvbfg_mapping = [
                 (".fused_qkvg_proj", ".q_proj", 0),
@@ -3496,16 +3550,18 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if param_name in {
                     ".fused_qkvbfg_a_proj",
                     ".fused_fg_b_proj",
+                    ".fused_qkv_proj",
                     ".fused_qkvg_proj",
                 }:
                     layer_id = int(name.split(".")[2])
                     if not self.config.is_kda_layer(layer_id):
                         continue
                     layer = self.model.layers[layer_id].self_attn
-                    # Full-rank K3 always instantiates fused_qkvg_proj, including
-                    # ModelSlim-quantized models. The low-rank fused modules are
-                    # still conditional on do_fuse_qkvbfg.
-                    if param_name == ".fused_qkvg_proj":
+                    # Full-rank K3 always instantiates fused_qkv_proj or
+                    # fused_qkvg_proj, including ModelSlim-quantized models.
+                    # The low-rank fused modules are still conditional on
+                    # do_fuse_qkvbfg.
+                    if param_name in {".fused_qkv_proj", ".fused_qkvg_proj"}:
                         if not getattr(layer, "use_full_rank_gate", False):
                             continue
                     elif not getattr(layer, "do_fuse_qkvbfg", False):
@@ -3672,6 +3728,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "qkv_conv1d": ["q_conv1d", "k_conv1d", "v_conv1d"],
+        "fused_qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "fused_qkvg_proj": ["q_proj", "k_proj", "v_proj", "g_proj"],
         "fused_qkvbfg_a_proj": [
             "q_proj",

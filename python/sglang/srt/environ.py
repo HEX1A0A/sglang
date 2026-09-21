@@ -1586,6 +1586,12 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
+    # Split the full-rank [q,k,v,g] fused projection into a fused [q,k,v]
+    # linear plus a standalone g_proj. Needed for ModelSlim-quantized K3
+    # checkpoints where q/k/v are W8A8_MXFP8 but g_proj stays FLOAT (mixed
+    # precision inside a single fused layer is not allowed). Default on;
+    # set to 0 to restore the original 4-way fused_qkvg_proj path.
+    SGLANG_K3_SPLIT_QKVG = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory
