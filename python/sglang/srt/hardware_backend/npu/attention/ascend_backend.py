@@ -1066,7 +1066,6 @@ class AscendAttnBackend(AttentionBackend):
         self, topk_indices: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
         current_tokens = topk_indices.shape[0]
-        rank = torch.distributed.get_rank()
         if current_tokens == num_tokens:
             return topk_indices
 
@@ -1078,7 +1077,7 @@ class AscendAttnBackend(AttentionBackend):
         pad_size = num_tokens - current_tokens
         padding = torch.full(
             (pad_size, topk_indices.shape[1]),
-            0,
+            -1,
             dtype=topk_indices.dtype,
             device=topk_indices.device,
         )
