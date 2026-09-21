@@ -472,8 +472,10 @@ class KimiK3MoE(nn.Module):
         # Each token fans out across distinct EP ranks and the per-rank load
         # stays within +/-1 for any token count; over a full period every
         # expert is hit exactly once. With a disjoint-token-shard a2a backend
-        # (DeepEP / FuseEP / ...), each rank additionally rolls the table by
-        # its EP rank so the combined EP-wide dispatch is perfectly balanced.
+        # (DeepEP / FuseEP / ...), each rank rolls the table by a rank-specific
+        # phase floor(ep_rank * period / ep_size), spread evenly across the
+        # period, so the combined EP-wide dispatch is balanced at BOTH the rank
+        # and the individual-expert level (each expert within +/-1 of the mean).
         # The entire layout (balanced period + rank phase + period repeat) is
         # baked into one static tensor here; the forward only takes a plain
         # view slice self.fake_topk[:num_tokens], i.e. zero launched ops and a
@@ -500,9 +502,20 @@ class KimiK3MoE(nn.Module):
                 or _a2a_backend.is_ascend_fuseep()
                 or _a2a_backend.is_mori()
             ):
-                # Ranks hold disjoint token shards: rank r's token t is global
-                # token t + r, so start its table r rows later.
-                row_shift = parallel.moe_ep_rank
+                # Ranks hold disjoint token shards. Give each rank a starting
+                # phase spread EVENLY across the period rows,
+                #   phi_r = floor(r * period / ep_size),
+                # instead of the contiguous phi_r = r. This scatters the ranks'
+                # entry points over the whole expert cycle, so across ranks the
+                # individual experts are hit within +/-1 of the mean (the
+                # pigeonhole optimum) at any token count, rather than piling on
+                # the experts in a contiguous block of rows. rank-level balance
+                # is unaffected because every row already fans out across the
+                # EP ranks. (Debug-only fake routing: the phase is arbitrary and
+                # need not track the real a2a token order.)
+                row_shift = (
+                    parallel.moe_ep_rank * period // ep_size
+                )
         else:
             tp_rank = parallel.tp_rank
             shift = tp_rank * num_experts // self.tp_size
