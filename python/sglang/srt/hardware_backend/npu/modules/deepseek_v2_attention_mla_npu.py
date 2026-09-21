@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.communicator import ScatterMode, get_attn_tp_context
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -219,6 +220,7 @@ def forward_mla_prepare_npu(
                     qkv_latent.shape[0] < 65536
                     and not dsa_use_prefill_cp(forward_batch)
                     and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
+                    and forward_batch.forward_mode != ForwardMode.EXTEND
                 ):
                     q, k_nope, k_pe = fused_split_qk_norm(
                         qkv_latent,
@@ -421,6 +423,7 @@ def forward_dsa_prepare_npu(
                 fused_qkv_a_proj_out.shape[0] < 65535
                 and not dsa_use_prefill_cp(forward_batch)
                 and not getattr(m, "_disable_npu_fused_split_qk_norm", False)
+                and forward_batch.forward_mode != ForwardMode.EXTEND
             ):
                 q_lora, k_nope, k_pe = fused_split_qk_norm(
                     fused_qkv_a_proj_out,
