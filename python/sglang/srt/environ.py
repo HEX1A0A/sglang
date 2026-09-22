@@ -1090,6 +1090,7 @@ class Envs:
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
     SGLANG_DEEPGEMM_PDL = EnvBool(True)
     SGLANG_PP_PARALLEL_DEEPGEMM_WARMUP = EnvBool(False)
+    SGLANG_NPU_DISPATCH_MXFP8 = EnvBool(False)
 
     # ===================================================================
     # Cache directories

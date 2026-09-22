@@ -784,6 +784,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             if self.use_fp8
             else dict()
         )
+        use_mxfp8 = envs.SGLANG_NPU_DISPATCH_MXFP8.get()
+        use_mxfp8_opts = (
+            dict(use_mxfp8=use_mxfp8)
+            if self.use_fp8
+            else dict()
+        )
+        quant_mode_opts = (
+            dict(quant_mode=self.quant_mode)
+            if self.quant_mode is not None
+            else dict()
+        )
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
@@ -793,7 +804,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=self.use_fp8,
+                use_fp8=use_mxfp8 or self.use_fp8,
                 **(
                     dict(topk_weights=topk_weights)
                     if _is_npu and not _use_zbal
@@ -807,12 +818,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 ),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **(
-                    dict(quant_mode=self.quant_mode)
-                    if self.quant_mode is not None
-                    else {}
-                ),
                 **fp8_deepgemm_scale_opts,
+                **use_mxfp8_opts,
+                **quant_mode_opts,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
