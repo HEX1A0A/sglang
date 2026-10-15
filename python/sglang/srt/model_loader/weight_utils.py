@@ -290,6 +290,19 @@ def get_quant_config(
         return quant_cls.from_config({})
 
     checkpoint_quant_spec = resolve_checkpoint_quant_spec(model_config.hf_config)
+    if model_config.quantization == "modelslim":
+        # Ascend exports may declare only the quantization method in config.json.
+        # Prefer the per-layer sidecar, while retaining inline-only descriptions.
+        has_sidecar = Path(
+            model_config.model_path, "quant_model_description.json"
+        ).is_file()
+        has_inline_description = checkpoint_quant_spec is not None and any(
+            isinstance(key, str) and key.endswith(".weight")
+            for key in checkpoint_quant_spec.config
+        )
+        if has_sidecar or not has_inline_description:
+            # Also lets remote summary-only exports use the download path below.
+            checkpoint_quant_spec = None
     if checkpoint_quant_spec is not None:
         hf_quant_config = checkpoint_quant_spec.config
         # For modelopt_mixed, config.json's quantization_config may not

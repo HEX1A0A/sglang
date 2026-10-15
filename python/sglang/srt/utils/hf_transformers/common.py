@@ -213,9 +213,20 @@ try:
         engram_pad_id = 2
         engram_compressed_vocab_size = 0
 
+    # Published V4.1 checkpoints use these names for the multimodal wrapper
+    # and its text config. Keep matching model_type for AutoConfig.register;
+    # the parser normalizes both to the runtime's existing V4.1 model_type.
+    class _DeepseekV41PublishedConfigAlias(_DeepseekV41ConfigAlias):
+        model_type = "deepseek_v41"
+
+    class _DeepseekV41TextConfigAlias(_DeepseekV41ConfigAlias):
+        model_type = "deepseek_v41_text"
+
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4.1"] = _DeepseekV41ConfigAlias
+    _CONFIG_REGISTRY["deepseek_v41"] = _DeepseekV41PublishedConfigAlias
+    _CONFIG_REGISTRY["deepseek_v41_text"] = _DeepseekV41TextConfigAlias
 
     # For kimi_k25_eagle3
     class _KimiK2ConfigAlias(_HFDeepseekV3Config):
@@ -596,6 +607,48 @@ def get_hf_text_config(config: PretrainedConfig):
 # ---------------------------------------------------------------------------
 # Model-specific helpers
 # ---------------------------------------------------------------------------
+
+
+def _normalize_deepseek_v41_config(config: PretrainedConfig) -> None:
+    """Adapt published V4.1 config names without changing the model's values.
+
+    Explicit legacy fields win if both spellings exist. Inspect instance
+    values instead of hasattr(): inherited defaults such as engram_pad_id
+    must not hide a checkpoint's engram_pad_token_id.
+    """
+    model_types = ("deepseek_v4.1", "deepseek_v41", "deepseek_v41_text")
+    if getattr(config, "model_type", None) not in model_types:
+        return
+
+    aliases = {
+        "kv_source_layer_ids": "kv_source_layers",
+        "index_source_layer_ids": "index_source_layers",
+        "candidate_source_layer_id": "candidate_source_layer",
+        "engram_pad_token_id": "engram_pad_id",
+    }
+    for target in (config, getattr(config, "text_config", None)):
+        if target is None:
+            continue
+        values = target if isinstance(target, dict) else vars(target)
+        for published, legacy in aliases.items():
+            if published in values and legacy not in values:
+                values[legacy] = values[published]
+        target_type = (
+            target.get("model_type")
+            if isinstance(target, dict)
+            else getattr(target, "model_type", None)
+        )
+        if target is config or target_type in model_types:
+            if isinstance(target, dict):
+                target["model_type"] = "deepseek_v4.1"
+            else:
+                target.model_type = "deepseek_v4.1"
+        architectures = values.get("architectures")
+        if architectures:
+            values["architectures"] = [
+                "DeepseekV4ForCausalLM" if arch == "DeepseekV41ForCausalLM" else arch
+                for arch in architectures
+            ]
 
 
 def _ensure_sub_configs(config: PretrainedConfig, *attr_names: str) -> None:

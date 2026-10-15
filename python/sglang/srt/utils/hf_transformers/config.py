@@ -34,6 +34,7 @@ from .common import (
     DeepseekVLV2Config,
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
+    _normalize_deepseek_v41_config,
     _override_v_head_dim_if_zero,
     check_gguf_file,
     get_hf_text_config,
@@ -150,16 +151,22 @@ class HfModelConfigParser(ModelConfigParserBase):
             else:
                 config._name_or_path = model
 
+        _normalize_deepseek_v41_config(config)
+
         # After potential registry reload, the fresh config may carry
         # parent-class defaults (e.g. DeepseekV3Config.hidden_size=7168)
         # that conflict with the checkpoint's nested text_config values
         # (e.g. V4.1 hidden_size=5120).  When text_config is still a plain
         # dict it means the registry reload just replaced the config and
         # the earlier flattening was lost — overwrite the outer config's
-        # text-level attributes from the dict so the model sees correct values.
+        # text-level attributes so the model sees correct values. V4.1 also
+        # needs this for object-valued text configs, whose explicit values
+        # must override inherited V3 defaults and carry the normalized aliases.
         if isinstance(model, str):
             _tc_raw = getattr(config, "text_config", None)
-            if isinstance(_tc_raw, dict):
+            if isinstance(_tc_raw, dict) or (
+                config.model_type == "deepseek_v4.1" and _tc_raw is not None
+            ):
                 _skip_keys = {
                     "text_config",
                     "vision_config",
@@ -170,7 +177,12 @@ class HfModelConfigParser(ModelConfigParserBase):
                     "auto_map",
                     "custom_pipelines",
                 }
-                for _key, _val in _tc_raw.items():
+                _tc_items = (
+                    _tc_raw.items()
+                    if isinstance(_tc_raw, dict)
+                    else vars(_tc_raw).items()
+                )
+                for _key, _val in _tc_items:
                     if _key not in _skip_keys and _val is not None:
                         setattr(config, _key, _val)
 

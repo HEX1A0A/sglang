@@ -106,6 +106,18 @@ class ModelSlimConfig(QuantizationConfig):
                 (remap(k) if isinstance(k, str) else k): v
                 for k, v in quant_config.items()
             }
+            optional = quant_config.get("optional", {})
+            storage = optional.get("embedding_storage")
+            if storage is not None:
+                quant_config["optional"] = {
+                    **optional,
+                    "embedding_storage": {
+                        **storage,
+                        "modules": {
+                            remap(k): v for k, v in storage.get("modules", {}).items()
+                        },
+                    },
+                }
 
         # Add an mlp.* alias for each block_sparse_moe.* key but KEEP the original,
         # so both module namings resolve

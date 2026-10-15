@@ -4096,6 +4096,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             return
         for module in self.modules():
             if isinstance(module, EngramEmbedding):
+                if _is_npu:
+                    module.validate_loaded_weights()
                 # Host-offloaded engram tables: flush the pinned staging
                 # chunks into the acc_offload GVA pool now that loading is done.
                 module.finalize_offload()

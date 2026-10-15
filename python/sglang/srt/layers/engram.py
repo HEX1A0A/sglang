@@ -465,7 +465,8 @@ class EngramEmbedding(nn.Module):
     all_reduce the row-shard partials over the full TP group, then scatter
     back to the local token segment. Storage follows the chip: arch35 keeps
     fp8 rows + e8m0 block scales (dequantized on the fly), everything else
-    stores bf16 rows directly.
+    stores bf16 rows directly. Explicit ModelSlim int8_sym storage on NPU
+    overrides this default with int8 rows and per-group fp32 scales.
 
     Host-offload (SGLANG_OPT_ENGRAM_HOST_OFFLOAD, NPU): the fp8 weight table
     lives in the node-local acc_offload GVA pool as slot-segmented chunks
@@ -484,18 +485,41 @@ class EngramEmbedding(nn.Module):
         dim: int,
         layer_hash_index: Optional[int] = None,
         config=None,
+        storage_spec: dict | None = None,
     ):
         super().__init__()
         # Offload mode never reads tp_size (no collective in _forward_offload);
         # the device path below shards over the FULL TP group.
         self.tp_size = get_tensor_model_parallel_world_size()
         self.offload = None
+        self._int8_embedding = storage_spec is not None
+        if self._int8_embedding:
+            expected = {
+                "format": "int8_sym",
+                "group_size": 32,
+                "axis": 1,
+                "scale_suffix": "scale",
+                "scale_dtype": "float32",
+                "output_dtype": "bfloat16",
+            }
+            if (
+                not is_npu()
+                or dim % 32
+                or any(storage_spec.get(k) != v for k, v in expected.items())
+            ):
+                raise ValueError(f"Unsupported NPU Engram storage: {storage_spec}")
+            self._int8_loaded = set()
         if (
             layer_hash_index is not None
             and config is not None
             and envs.SGLANG_OPT_ENGRAM_HOST_OFFLOAD.get()
             and is_npu()
         ):
+            if self._int8_embedding:
+                raise NotImplementedError(
+                    "INT8 Engram storage requires device-resident tables; "
+                    "disable SGLANG_OPT_ENGRAM_HOST_OFFLOAD."
+                )
             manager = get_engram_offload_manager(config)
             self.offload = manager.table(layer_hash_index)
             self._offload_manager = manager
@@ -558,10 +582,25 @@ class EngramEmbedding(nn.Module):
                 "fp8 weight + scale device-resident" if self._is_arch35 else "bf16 weight, no scale",
             )
             return
-        assert num_embeddings % self.tp_size == 0, (num_embeddings, self.tp_size)
-        self.rows = num_embeddings // self.tp_size
+        if is_npu():
+            self.rows = (num_embeddings + self.tp_size - 1) // self.tp_size
+        else:
+            assert num_embeddings % self.tp_size == 0, (num_embeddings, self.tp_size)
+            self.rows = num_embeddings // self.tp_size
+        self.num_embeddings = num_embeddings
         self.row_start = get_tensor_model_parallel_rank() * self.rows
-        if not is_npu_arch35():
+        self.valid_rows = max(0, min(self.rows, num_embeddings - self.row_start))
+        if self._int8_embedding:
+            self.weight = nn.Parameter(
+                torch.empty(self.rows, dim, dtype=torch.int8), requires_grad=False
+            )
+            self.scale = nn.Parameter(
+                torch.empty(self.rows, dim // 32, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.weight.weight_loader = self._load_rows
+            self.scale.weight_loader = self._load_rows
+        elif not is_npu_arch35():
             self.weight = nn.Parameter(
                 torch.empty(self.rows, dim, dtype=torch.bfloat16),
                 requires_grad=False,
@@ -580,7 +619,29 @@ class EngramEmbedding(nn.Module):
             self.scale.weight_loader = self._load_rows
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
-        param.data.copy_(loaded_weight[self.row_start : self.row_start + self.rows])
+        if self._int8_embedding:
+            expected_shape = (self.num_embeddings, param.shape[1])
+            if (
+                loaded_weight.dtype != param.dtype
+                or loaded_weight.shape != expected_shape
+            ):
+                raise ValueError(
+                    f"INT8 Engram expects {param.dtype} {expected_shape}, got "
+                    f"{loaded_weight.dtype} {tuple(loaded_weight.shape)}"
+                )
+        param.data[: self.valid_rows].copy_(
+            loaded_weight[self.row_start : self.row_start + self.valid_rows]
+        )
+        if self.valid_rows < self.rows:
+            # Clear only padding, including byte-encoded native FP8 scales.
+            param.data[self.valid_rows :].view(torch.uint8).zero_()
+        if self._int8_embedding:
+            self._int8_loaded.add("weight" if param is self.weight else "scale")
+
+    def validate_loaded_weights(self):
+        if self._int8_embedding and self._int8_loaded != {"weight", "scale"}:
+            missing = {"weight", "scale"} - self._int8_loaded
+            raise ValueError(f"Missing INT8 Engram checkpoint tensors: {sorted(missing)}")
 
     def _load_weight_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         rows = loaded_weight[self.row_start : self.row_start + self.rows]
@@ -754,9 +815,14 @@ class EngramEmbedding(nn.Module):
         """indices [..., n_cols] -> bf16 [.., n_cols, head_dim], zeroed on rows
         this rank's shard does not own."""
         local = indices - self.row_start
-        owned = (local >= 0) & (local < self.rows)
+        owned = (local >= 0) & (local < self.valid_rows)
         local = local.masked_fill(~owned, 0)
-        if not is_npu_arch35():
+        if self._int8_embedding:
+            rows = self.weight[local].float().unflatten(-1, (-1, 32))
+            scales = self.scale[local].unsqueeze(-1)
+            values = (rows * scales).flatten(-2).to(torch.bfloat16)
+            return values.masked_fill(~owned.unsqueeze(-1), 0)
+        elif not is_npu_arch35():
             return self.weight[local].to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         else:
             w = self.weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
@@ -840,11 +906,24 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
+        storage_spec = None
+        if is_npu() and quant_config is not None:
+            storage = (
+                getattr(quant_config, "quant_description", {})
+                .get("optional", {})
+                .get("embedding_storage", {})
+            )
+            storage_spec = storage.get("modules", {}).get(add_prefix("embed", prefix))
+            if storage_spec is not None and storage.get("version") != 1:
+                raise ValueError(
+                    f"Unsupported Engram storage version: {storage.get('version')}"
+                )
         self.embed = EngramEmbedding(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
             layer_hash_index=self.layer_hash_index,
             config=config,
+            storage_spec=storage_spec,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
