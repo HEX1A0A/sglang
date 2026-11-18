@@ -18,6 +18,14 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=8, suite="base-a-test-npu")
 
+# apply_all_hf_patches() imports transformers submodules that pull in
+# accelerate, whose state module probes find_spec("torch_npu") at import
+# time; that probe raises on the torch_npu mock installed below (a
+# MagicMock has no __spec__). Run the patches while the module space is
+# still clean -- a bare `import transformers` stays lazy and never
+# reaches accelerate, so it would not cover this.
+import sglang.srt.hf_transformers  # noqa: F401
+
 # The backend imports ragged_verify at module level, so load the REAL module
 # before the stub block below shadows its package parent.
 from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
@@ -26,6 +34,10 @@ for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.indexer",
+    "sgl_kernel_npu.operators.mem_cache",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -50,12 +62,13 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     LowRatioCompressAscendBackendMixin,
 )
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
-from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
 from sglang.srt.layers.quantization import fp8_utils
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
     get_dsv4_indexer_bytes_per_token,
@@ -66,7 +79,7 @@ from sglang.srt.mem_cache.registry import create_unified_radix_cache
 class _Ds41Stub(ModuleType):
     """Stand-in for the entry points ``_ds41_ops`` returns.
 
-    Only the two metadata entry points are exercised by these tests; both return
+    Only the metadata entry points are exercised by these tests; each returns
     a real int32 tensor so the graph-buffer ``torch.zeros_like`` probe works.
     """
 
@@ -292,29 +305,24 @@ class TestPoolFactory(unittest.TestCase):
         # One row per slot: the window page is the global page.
         self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 128)
 
-    def test_ratio1_compressed_pool_is_fp4_despite_the_global_page(self):
-        out, calls = self._make(
-            page_size=128,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-
-    def test_ratio2_compressed_pool_is_fp4(self):
-        out, calls = self._make(
-            page_size=64,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-        # A ratio-2 compressed page holds global // 2 rows.
-        self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 64)
+    def test_compressed_pools_are_fp4(self):
+        # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
+        # global // 2 rows. Both take the compressed row format.
+        for page_size in (128, 64):
+            with self.subTest(page_size=page_size):
+                out, calls = self._make(
+                    page_size=page_size,
+                    global_page_size=128,
+                    kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(out, "DSV41NPUSingleKVPool")
+                self.assertIs(
+                    calls["DSV41NPUSingleKVPool"]["layout"],
+                    NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(
+                    calls["DSV41NPUSingleKVPool"]["kernel_page_size"], page_size
+                )
 
     def test_v4_window_pool_arrives_pre_tagged(self):
         out, calls = self._make(
@@ -576,24 +584,30 @@ class TestPdBufferEnumeration(unittest.TestCase):
 
 
 class TestCompact1d(unittest.TestCase):
+    """``_stable_compact_1d``: compact into a fixed buffer without NonZero.
+
+    The helper lives on the concrete backend since the verify/seq-metadata
+    unification; the mixin owns the row-value formulas, not the compaction.
+    """
+
     def test_dense_front_with_custom_fill(self):
         dst = torch.full((5,), 99, dtype=torch.int32)
         values = torch.tensor([10, 20, 30], dtype=torch.int64)
         keep = torch.tensor([True, False, True], dtype=torch.bool)
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=-1)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=-1)
         self.assertEqual(dst.tolist(), [10, 30, -1, -1, -1])
 
     def test_overflow_rows_are_dropped_instead_of_raised(self):
         dst = torch.full((2,), 7, dtype=torch.int32)
         values = torch.tensor([1, 2, 3], dtype=torch.int64)
         keep = torch.tensor([True, True, True])
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=0)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=0)
         self.assertEqual(dst.tolist(), [1, 2])
 
     def test_size_mismatch_is_rejected(self):
         dst = torch.zeros(3, dtype=torch.int32)
         with self.assertRaises(ValueError):
-            LowRatioCompressAscendBackendMixin._dsv41_compact_1d(
+            DeepseekV4AscendAttnBackend._stable_compact_1d(
                 dst, torch.tensor([1, 2]), torch.tensor([True]), fill=0
             )
 
@@ -797,6 +811,9 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        # The unified replay refresh expands the index page tables before the
+        # mode-specific rows (the 1d refresh no longer does it itself).
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # Address is stable (the captured graph holds it) and the content is the
         # [k*p, k*p + k) expansion of the refreshed block table.
@@ -841,6 +858,7 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # ratio 2 pages 1:1, ratio 1 expands each full page into two index pages.
         self.assertEqual(metadata.c2_index_page_table.tolist(), [[9, 8]])
@@ -1137,6 +1155,12 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             actual_seq_lengths_q_pa=torch.arange(0, 2, dtype=torch.int32),
             actual_seq_lengths_kv=torch.tensor(seq_lens, dtype=torch.int32),
             swa_page_table=torch.zeros((1, 2), dtype=torch.int32),
+            # The metadata pass owns the window geometry: the body reads these
+            # graph-resident buffers instead of recomputing them.
+            dsv41_win_sparse_indices=torch.zeros((1, 1, window), dtype=torch.int32),
+            dsv41_win_topk_length=torch.full(
+                (1, 1), min(window, seq_lens[0]), dtype=torch.int32
+            ),
             **{
                 f"c{ratio}_page_table": torch.zeros((1, 2), dtype=torch.int32),
                 "kernel_metadata": {
@@ -1149,6 +1173,12 @@ class TestLowRatioAttentionBody(unittest.TestCase):
                 fm,
                 f"c{ratio}_topk_indices",
                 torch.zeros((1, backend._dsv4_index_topk), dtype=torch.int32),
+            )
+        if ratio > 0:
+            setattr(
+                fm,
+                f"dsv41_cmp_topk_length_c{ratio}",
+                torch.full((1, 1), seq_lens[0] // ratio, dtype=torch.int32),
             )
         backend.forward_metadata = fm
         backend.token_to_kv_pool = SimpleNamespace(
@@ -1188,8 +1218,9 @@ class TestLowRatioAttentionBody(unittest.TestCase):
         self.assertIs(kw["cmp_block_table"], fm.c2_page_table)
         self.assertEqual(kw["cmp_sparse_indices"].shape, (1, 1, 512))
         self.assertIs(kw["metadata"], fm.kernel_metadata["c2a_metadata"])
-        # Per-query lengths are derived from the live positions: p = 6 -> the
-        # 7th token closes the 3rd pair, capped by index_topk.
+        # Per-query lengths come from the metadata pass, which derives them
+        # from the live positions: p = 6 -> the 7th token closes the 3rd pair,
+        # capped by index_topk.
         self.assertEqual(kw["cmp_topk_length"].tolist(), [[3]])
         # Reserved by the operator, but derived from seq_lens.
         self.assertEqual(kw["seqused_cmp_kv"].tolist(), [3])
@@ -1389,13 +1420,15 @@ class TestC128ComponentGating(unittest.TestCase):
             if sidecar
             else SimpleNamespace()
         )
-        params = SimpleNamespace(
+        # The registry writes the slots onto ``params.tree_slots`` and the cache
+        # reads ``params.tree_components``, which is a derived property of that
+        # field -- so params must be the real dataclass, not a plain namespace.
+        params = CacheInitParams(
+            disable=False,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=SimpleNamespace(storage=None, size=1024),
+            page_size=1,
             sliding_window_size=128,
-            draft_swa_window=0,
-            component_registry_override=None,
-            tree_slots=(),
         )
         ctx = SimpleNamespace(
             server_args=None,
@@ -1558,8 +1591,8 @@ class TestVerifyGraphGuards(unittest.TestCase):
     """The `_apply_dsv4_graph_metadata` verify arm and the startup guards.
 
     V4.1 owns its verify replay, a stage without
-    low ratios (V4 model or draft worker) keeps its silent bypass, and COMPACT
-    ragged verify is rejected at startup.
+    low ratios (V4 model or draft worker) keeps its silent bypass, and the V4.1
+    startup gate requires DSpark on the STATIC verify layout.
     """
 
     class _GraphMode:
@@ -1672,26 +1705,57 @@ class TestVerifyGraphGuards(unittest.TestCase):
         _, verify_calls = self._run_replay(dspark=False)
         self.assertEqual(verify_calls, ["refresh"])
 
-    def _ensure_static_mode(self, mode, arch35=True):
-        with (
-            patch.object(dsv4_backend, "read_ragged_verify_mode", lambda: mode),
-            patch.object(dsv4_backend, "is_npu_arch35", lambda: arch35),
-        ):
-            dsv4_backend._ensure_dsv41_static_verify_mode()
+    def _validate_spec(
+        self, *, is_v41=True, is_none=False, is_dspark=False, is_dflash=False
+    ):
+        backend = _low_ratio_backend()
+        backend._dsv4_is_v41_model = is_v41
+        spec = SimpleNamespace(
+            is_none=lambda: is_none,
+            is_dspark=lambda: is_dspark,
+            is_dflash=lambda: is_dflash,
+        )
+        return backend, spec
 
-    def test_compact_on_arch35_raises_with_unset_guidance(self):
-        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
-            self._ensure_static_mode(RaggedVerifyMode.COMPACT)
+    def _gate(self, *, mode=RaggedVerifyMode.STATIC, **spec_kwargs):
+        """Run ``_validate_spec_support`` on a V4.1 backend under ``mode``."""
+        backend, spec = self._validate_spec(**spec_kwargs)
+        with patch.object(dsv4_backend, "read_ragged_verify_mode", lambda: mode):
+            backend._validate_spec_support(spec)
 
-    def test_static_and_cap_accept_pass(self):
-        # CAP_ACCEPT only changes the accept-length accounting, so it rides
-        # the STATIC execution path.
-        self._ensure_static_mode(RaggedVerifyMode.STATIC)
-        self._ensure_static_mode(RaggedVerifyMode.CAP_ACCEPT)
+    def test_v41_accepts_dspark_under_static(self):
+        self._gate(is_dspark=True)
 
-    def test_compact_on_a3_uses_the_same_fixed_width_guard(self):
-        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
-            self._ensure_static_mode(RaggedVerifyMode.COMPACT, arch35=False)
+    def test_v41_rejects_a_non_dspark_algorithm(self):
+        # The low-ratio rows assume the STATIC request-major rectangle; another
+        # algorithm would scatter this step's compressed rows to stale slots.
+        with self.assertRaisesRegex(ValueError, "DSpark"):
+            self._gate()
+
+    def test_v41_rejects_dflash(self):
+        # DFlash shares DFlashVerifyInfo with DSpark but is a distinct algorithm.
+        with self.assertRaisesRegex(ValueError, "DSpark"):
+            self._gate(is_dflash=True)
+
+    def test_v41_rejects_every_ragged_mode_even_for_dspark(self):
+        # CAP_ACCEPT and COMPACT both leave the STATIC request-major rectangle.
+        # Match the env-var name, not "DSpark": both raises mention DSpark, so
+        # only this pins the mode check as the one that fired.
+        for mode in (RaggedVerifyMode.CAP_ACCEPT, RaggedVerifyMode.COMPACT):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"):
+                    self._gate(mode=mode, is_dspark=True)
+
+    def test_no_spec_decoding_is_not_gated(self):
+        # The constraints are about speculative decoding; a decode-only V4.1 run
+        # is unaffected even if a ragged env value is left set.
+        self._gate(is_none=True, mode=RaggedVerifyMode.COMPACT)
+
+    def test_a_v4_model_is_not_gated(self):
+        # V4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH on any mode. The
+        # gate reads the generation, not the ratio list, so a draft worker (whose
+        # ratios are emptied but whose generation still resolves) is gated too.
+        self._gate(is_v41=False, mode=RaggedVerifyMode.COMPACT)
 
 
 class _FakeTorchOps:
@@ -1929,18 +1993,23 @@ class TestKernelMetadataBuilders(unittest.TestCase):
 
         # Call order is (ratio 0, *low_ratios): the window table first, with
         # has_cmp_kv=False and an all-zero compressed length (no compressed pool).
-        win_args, win_kwargs = calls[0]
-        self.assertIs(win_args[0], fm.dsv41_win_topk_length)
+        win_kwargs = calls[0][1]
+        self.assertIs(win_kwargs["ori_topk_length"], fm.dsv41_win_topk_length)
         self.assertIs(win_kwargs["has_cmp_kv"], False)
-        self.assertTrue(torch.all(win_args[1] == 0))
-        self.assertEqual(win_args[1].shape, win_args[0].shape)
+        self.assertTrue(torch.all(win_kwargs["cmp_topk_length"] == 0))
+        self.assertEqual(
+            win_kwargs["cmp_topk_length"].shape, win_kwargs["ori_topk_length"].shape
+        )
 
-        for (args, kwargs), ratio in zip(calls[1:], (1, 2)):
-            self.assertEqual(tuple(args[0].shape), (2, 1))
+        for (_, kwargs), ratio in zip(calls[1:], (1, 2)):
+            self.assertEqual(tuple(kwargs["ori_topk_length"].shape), (2, 1))
             self.assertIs(kwargs["has_cmp_kv"], True)
             # The per-query compressed length is the graph-resident buffer, so
             # the mixed builder refreshes rather than allocates.
-            self.assertIs(args[1], getattr(fm, f"dsv41_cmp_topk_length_c{ratio}"))
+            self.assertIs(
+                kwargs["cmp_topk_length"],
+                getattr(fm, f"dsv41_cmp_topk_length_c{ratio}"),
+            )
 
         for args, kwargs in calls:
             self.assertEqual(kwargs["num_heads_q"], 64)
@@ -2167,7 +2236,8 @@ class TestQliKvLens(unittest.TestCase):
             batch_size=2,
             draft_token_num=3,
         )
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # ratio 1 first, then ratio 2; the bound is the final length:
         # 9//2 == 4 covers the group pos 7 closes.
         self.assertIsNone(seen[0]["cmp_residual_k"])
@@ -2193,7 +2263,8 @@ class TestQliKvLens(unittest.TestCase):
             positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2
         )
         batch.forward_mode = _Mode("decode")
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # Decode ignores the final mirror.
         self.assertEqual(seen[1]["seqused_k"].tolist(), [3, 2])
 
@@ -2217,7 +2288,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             draft_token_num=2,
         )
         indices, lengths = backend._dsv41_window_indices(batch)
-        self.assertEqual(lengths[:, 0].tolist(), [2, 2, 0, 0])
+        self.assertEqual(lengths[:, 0].tolist(), [4, 4, 0, 0])
         # Live rows unchanged; padding rows emit no indices at all.
         self.assertEqual(indices[0, 0].tolist(), [1, 2, 3, 4])
         self.assertEqual(indices[1, 0].tolist(), [2, 3, 4, 5])
@@ -2226,7 +2297,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             backend._dsv41_cmp_topk_length(batch, 2)[:, 0].tolist(), [2, 3, 0, 0]
         )
         self.assertEqual(
-            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [2, 3, 0, 0]
+            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [3, 3, 0, 0]
         )
 
     def test_decode_rows_keep_the_per_row_rule(self):
@@ -2276,8 +2347,9 @@ class TestVerifyPaddingRows(unittest.TestCase):
 
 
 class TestVerifyGraphRefresh(unittest.TestCase):
-    """``_refresh_graph_dsv41_verify_1d`` writes the captured buffers with the
-    same values the eager builder derives -- element for element."""
+    """``_refresh_graph_verify_rows`` writes the captured buffers with the same
+    values the eager builder derives -- element for element -- and the decode
+    refresh touches only the rows it owns."""
 
     def _graph_metadata(self, backend, bs, tokens_per_req):
         metadata = SimpleNamespace(
@@ -2302,6 +2374,10 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             raw_bs=sum(1 for v in live if v > 0),
             tokens_per_bs=w,
             device=torch.device("cpu"),
+            has_compress=False,
+            is_idle_replay=False,
+            ragged_layout=None,
+            verify_lens=None,
             live_seq_lens=torch.tensor(live, dtype=torch.int32),
             forward_batch=SimpleNamespace(
                 positions=torch.tensor(positions, dtype=torch.int64),
@@ -2342,7 +2418,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             positions=positions,
             out_cache_loc=out_cache_loc,
         )
-        backend._refresh_graph_dsv41_verify_1d(ctx)
+        backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(metadata.c1_loc.tolist(), eager.c1_loc.tolist())
         self.assertEqual(metadata.c2_loc.tolist(), eager.c2_loc.tolist())
         self.assertEqual(
@@ -2379,7 +2455,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
             positions=[6, 7, 8, 99, 99, 99],
             out_cache_loc=[300, 301, 302],
         )
-        backend._refresh_graph_dsv41_verify_1d(ctx)
+        backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(metadata.c2_loc.tolist(), [150, -1, -1, -1, -1])
         self.assertEqual(metadata.c1_loc.tolist(), [300, 301, 302, -1, -1, -1])
         self.assertEqual(metadata.positions_cmp_padding_c2.tolist(), [6, 0, 0, 0, 0])
@@ -2391,15 +2467,7 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         backend.page_size = 128
         metadata = self._graph_metadata(backend, bs=2, tokens_per_req=3)
         metadata.block_tables[0, 0] = 11
-        positions, out_cache_loc = self._WINDOW
-        ctx = self._ctx(
-            metadata,
-            bs=2,
-            live=[6, 5],
-            positions=positions,
-            out_cache_loc=out_cache_loc,
-        )
-        backend._refresh_graph_dsv41_verify_1d(ctx)
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         # ratio 2 pages 1:1 with the full table; ratio 1 doubles every full page.
         self.assertEqual(metadata.c2_index_page_table.tolist(), [[11, 8], [9, 10]])
         self.assertEqual(metadata.c1_index_page_table[0].tolist(), [22, 23, 16, 17])
@@ -2421,12 +2489,38 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         self.assertEqual(metadata.positions_cmp_padding_c2.tolist(), [0] * 5)
         self.assertEqual(metadata.dsv41_cmp_topk_length_c2.tolist(), [[0]] * 6)
         # Zero length with a legal first index: the window side skips instead
-        # of feeding MQSMLA an in-prefix -1.
-        self.assertTrue((metadata.dsv41_win_sparse_indices == -1).all())
-        self.assertEqual(metadata.dsv41_win_sparse_indices[0, 0, 0].item(), 0)
+        # of feeding MQSMLA an in-prefix -1. Column 0 stays 0; the rest read
+        # nothing.
+        self.assertTrue((metadata.dsv41_win_sparse_indices[:, :, 1:] == -1).all())
+        self.assertTrue((metadata.dsv41_win_sparse_indices[:, :, 0] == 0).all())
         self.assertEqual(metadata.dsv41_win_topk_length.tolist(), [[0]] * 6)
         self.assertEqual(metadata.start_pos.tolist(), [0, 0])
         self.assertEqual(metadata.seqused.tolist(), [0, 0])
+
+    def test_decode_replay_leaves_the_verify_rows_alone(self):
+        # Decode owns the shared scalars and the c{1,2} rows; the verify-only
+        # topk lengths must survive untouched, or a decode step would inherit a
+        # verify step's sparse map.
+        backend = _low_ratio_backend()
+        metadata = self._graph_metadata(backend, bs=2, tokens_per_req=1)
+        metadata.dsv41_win_topk_length.fill_(4)
+        metadata.dsv41_cmp_topk_length_c2.fill_(3)
+        ctx = self._ctx(
+            metadata,
+            bs=2,
+            live=[6, 5],
+            positions=[5, 4],
+            out_cache_loc=[300, 400],
+            w=1,  # decode feeds one row per request.
+        )
+        backend._refresh_graph_decode_rows(ctx)
+        # start_pos = last live position, seqused = live flag.
+        self.assertEqual(metadata.start_pos.tolist(), [5, 4])
+        self.assertEqual(metadata.seqused.tolist(), [1, 1])
+        self.assertEqual(metadata.c1_loc.tolist(), [300, 400])
+        self.assertEqual(metadata.positions_cmp_padding_c1.tolist(), [5, 4])
+        self.assertTrue((metadata.dsv41_win_topk_length == 4).all())
+        self.assertTrue((metadata.dsv41_cmp_topk_length_c2 == 3).all())
 
 
 class TestDs41OperatorResolver(unittest.TestCase):
@@ -2436,15 +2530,15 @@ class TestDs41OperatorResolver(unittest.TestCase):
         operator_groups = {
             "sgl_kernel_npu.operators.attention": (
                 "compressor_v2",
-                "mixed_quant_sparse_flash_mla",
-                "mixed_quant_sparse_flash_mla_metadata",
+                "mixed_quant_sparse_flash_mla_dsl",
+                "mixed_quant_sparse_flash_mla_metadata_dsl",
             ),
             "sgl_kernel_npu.operators.indexer": (
-                "indexer_prologue_k",
-                "quant_lightning_indexer",
-                "quant_lightning_indexer_metadata",
-                "quant_sparse_lightning_indexer",
-                "quant_sparse_lightning_indexer_metadata",
+                "indexer_prologue_k_dsl",
+                "quant_lightning_indexer_dsl",
+                "quant_lightning_indexer_metadata_dsl",
+                "quant_sparse_lightning_indexer_dsl",
+                "quant_sparse_lightning_indexer_metadata_dsl",
             ),
         }
         stub_modules = {}
