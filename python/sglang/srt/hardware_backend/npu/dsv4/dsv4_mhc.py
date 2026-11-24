@@ -1,4 +1,4 @@
-"""A3 DSV4.1 mHC using native Torch operators, without the A5 fused kernels."""
+"""A3 DSV4.1 mHC coefficients and residual mixing."""
 
 from __future__ import annotations
 
@@ -9,6 +9,29 @@ import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4_mhc import HcSubLayer, HcTriplet
+
+
+def mix_stats(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
+    cfg = hc.cfg
+    if x.shape[0] == 0 or cfg.mult != 4 or cfg.sinkhorn_iters != 20:
+        return mix_stats_torch(hc, x)
+
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+
+    # DSV4.1 consumes the preceding sublayer's pre-mix for this input.
+    # Only this sublayer's coefficients are needed from the CANN operator.
+    _, post, comb, pre = mhc_pre_sinkhorn(
+        x,
+        hc.fn,
+        hc.scale,
+        hc.base,
+        cfg.mult,
+        cfg.sinkhorn_iters,
+        cfg.eps,
+        cfg.rms_eps,
+        return_pre=True,
+    )
+    return pre, post, comb.reshape(-1, cfg.mult, cfg.mult)
 
 
 def mix_stats_torch(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
